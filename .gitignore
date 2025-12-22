@@ -1,2 +1,15 @@
 *.h5
 *.xdmf
+**/data/sample_001*/
+**/data/sample_002*/
+**/data/sample_003*/
+**/data/sample_004*/
+**/data/sample_005*/
+**/data/sample_006*/
+**/data/sample_007*/
+**/data/sample_008*/
+**/data/sample_009*/
+**/data/sample_01*/
+**/data/sample_02*/
+**/data/sample_03*/
+**/data/sample_04*/

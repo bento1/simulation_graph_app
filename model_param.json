@@ -1,0 +1,8 @@
+{
+  "in_dim": 22,
+  "edgie_dim": 4,
+  "hidden": 64,
+  "layers": 4,
+  "out_dim": 3,
+  "dropout": 0.1
+}
