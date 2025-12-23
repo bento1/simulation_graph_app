@@ -6,6 +6,7 @@ from utils import feature_normalize
 import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
+from torch_geometric.utils import k_hop_subgraph
 
 def cells_to_edges(cells_df: pd.DataFrame, undirected=True) -> np.ndarray:
     cols = ["node_0", "node_1", "node_2", "node_3"]
@@ -79,21 +80,55 @@ class FemGraphDataset(Dataset):
         print("Loading FEM graph dataset...")
         for sd in tqdm(self.samples):
             full_data = self._load_full_graph(sd)
-            subgraphs = self._split_graph(full_data, 2000)
+            subgraphs = self._split_graph(full_data, 500)
             self.data_list.extend(subgraphs)
         print("Build Complete FEM graph dataset...")
 
     def len(self):
         return len(self.data_list)
     
-    def _split_graph(self, data: Data, max_nodes=2000):
+    # def _split_graph(self, data: Data, max_nodes=2000):
+    #     subgraphs = []
+    #     N = data.num_nodes
+    #     perm = torch.randperm(N)
+
+    #     for i in range(0, N, max_nodes):
+    #         idx = perm[i:i+max_nodes]
+    #         sub = data.subgraph(idx)
+    #         subgraphs.append(sub)
+
+    #     return subgraphs
+    def _split_graph(self, data: Data, max_nodes=2000, k_halo=2):
+        """
+        Overlap subgraph:
+        - core: max_nodes 개
+        - halo: k_halo-hop 이웃
+        """
         subgraphs = []
         N = data.num_nodes
         perm = torch.randperm(N)
 
         for i in range(0, N, max_nodes):
-            idx = perm[i:i+max_nodes]
-            sub = data.subgraph(idx)
+            seed = perm[i:i+max_nodes]
+
+            # k_halo hop 확장 (core + halo)
+            nodes, edge_index, mapping, edge_mask = k_hop_subgraph(
+                seed,
+                k_halo,
+                data.edge_index,
+                relabel_nodes=True,
+                num_nodes=N
+            )
+
+            # subgraph 생성
+            sub = data.subgraph(nodes)
+
+            # core mask (subgraph 기준)
+            core_mask = torch.zeros(sub.num_nodes, dtype=torch.bool)
+            # mapping: seed -> subgraph index
+            core_mask[mapping] = True
+            sub.core_mask = core_mask
+
             subgraphs.append(sub)
 
         return subgraphs

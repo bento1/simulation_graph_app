@@ -10,7 +10,7 @@ from fem_model import MeshGNN
 from tqdm import tqdm
 from utils import EarlyStopping
 early_stopping = EarlyStopping(
-    patience=20,     # FEM/GNN은 15~30 권장
+    patience=50,     # FEM/GNN은 15~30 권장
     min_delta=1e-6,  # loss 스케일에 맞게
     mode="min"
 )
@@ -20,9 +20,11 @@ def train_one_epoch(model, loader, opt, device, scale_y=1.0):
     model.train()
     total = 0.0
     for i,batch in enumerate(loader):
+        batch.y = batch.y * scale_y
         batch = batch.to(device)
         pred = model(batch)
-        loss = F.mse_loss(pred, batch.y * scale_y)
+        mask = batch.core_mask
+        loss = F.mse_loss(pred[mask], batch.y[mask])
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -35,9 +37,11 @@ def eval_one_epoch(model, loader, device, scale_y=1.0):
     model.eval()
     total = 0.0
     for batch in loader:
+        batch.y = batch.y * scale_y
         batch = batch.to(device)
         pred = model(batch)
-        loss = F.mse_loss(pred, batch.y * scale_y)
+        mask = batch.core_mask
+        loss = F.mse_loss(pred[mask], batch.y[mask] )
         total += float(loss.item())
     return total / max(1, len(loader))
 
@@ -45,7 +49,7 @@ def eval_one_epoch(model, loader, device, scale_y=1.0):
 def main():
     root = "./data"
     if torch.cuda.is_available() :
-        device='gpu'
+        device='cuda'
     elif torch.backends.mps.is_available() :
         device='mps'
     else :
@@ -63,12 +67,12 @@ def main():
 
     example = ds[0]
     in_dim = example.x.shape[1]
-    model_param={'in_dim':example.x.shape[1], 'edgie_dim':4, 'hidden':64, 'layers':4, 'out_dim':3, 'dropout':0.1}
+    model_param={'in_dim':example.x.shape[1], 'edgie_dim':4, 'hidden':64, 'layers':4, 'out_dim':3, 'dropout':0.1,'SCALE_Y':1e5}
     model = MeshGNN(in_dim=in_dim, edge_dim=4, hidden=64, layers=4, out_dim=3, dropout=0.1).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-6)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-6)
 
     # 변위 스케일(안정성용): e-6 수준이면 1e6 곱해서 학습 추천
-    SCALE_Y = 1e6
+    SCALE_Y = 1e5
     loss_dict={}
     for epoch in tqdm(range(1, 1000)):
         tr = train_one_epoch(model, train_loader, opt, device, scale_y=SCALE_Y)
