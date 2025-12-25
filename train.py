@@ -9,8 +9,9 @@ from fem_dataset import FemGraphDataset
 from fem_model import MeshGNN
 from tqdm import tqdm
 from utils import EarlyStopping
+
 early_stopping = EarlyStopping(
-    patience=50,     # FEM/GNN은 15~30 권장
+    patience=20,     # FEM/GNN은 15~30 권장
     min_delta=1e-6,  # loss 스케일에 맞게
     mode="min"
 )
@@ -65,12 +66,13 @@ def main():
 
     model_param={'in_dim':example.x.shape[1],
             'edge_dim':4,
-            'hidden':128,
+            'hidden':256,
             'layers':4,
             'out_dim':3,
             'dropout':0.1,
             'dataset_scale_info':ds.scale_info,
-            'loss_scale':1000.0
+            'loss_scale':1000.0,
+            'learning_rate':1e-3
             }
     
     model = MeshGNN(in_dim=model_param['in_dim'],
@@ -80,7 +82,7 @@ def main():
                 out_dim=model_param['out_dim'],
                 dropout=model_param['dropout']).to(device)
     
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-6)
+    opt = torch.optim.AdamW(model.parameters(), lr=model_param['learning_rate'], weight_decay=1e-6)
 
 
     loss_dict={}
@@ -102,7 +104,7 @@ def main():
                 json.dump(model_param, f, indent=2)
         if early_stopping.should_stop:
             print(
-                f"\n🛑 Early stopping at epoch {epoch} "
+                f"\n Early stopping at epoch {epoch} "
                 f"(best val = {best_val:.6e})"
             )
             break
