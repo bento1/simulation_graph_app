@@ -30,32 +30,13 @@ def get_von_mises(sx, sy, sz, txy, tyz, tzx):
     )   
 
 name="sample"
-root_path=r'./data'
-def gen_vibration_data(sample_num):
+root_path=r'./test'
+def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu,rho,m_add,freq,a_base,zeta):
     path=f"{root_path}/{name}_{sample_num:04d}"
     if not isExistFolder(path):
         makeFolder(path)
 
     params={}
-    Lx =random.uniform(1, 10)
-    Ly = random.uniform(0.1, 10)
-    Lz =random.uniform(0.1, 10)
-    nx= random.randint(10, 50)  # a <= x <= b
-    ny= random.randint(5, 20) 
-    nz= random.randint(5, 20) 
-    xm0  = random.uniform(Lx/nx, Lx//2)
-    xm1= xm0+Lx/nx*2
-    ym0= random.uniform(0, Ly-Ly/ny)
-    ym1 = ym0+Ly/ny*2
-    zm0= random.uniform(0, Lz-Lz/nz)
-    zm1 = zm0+Lz/nz*2
-    E = random.uniform(100e9, 300e9)
-    nu = random.uniform(0.1, 0.6)
-    rho = random.uniform(6000, 8000)
-    m_add = random.uniform(1, 100)
-    freq = random.uniform(80, 300)
-    a_base = random.uniform(1, 20)
-    zeta = random.uniform(.0001, 0.01)
 
     params['Lx']=Lx
     params['Ly']=Ly
@@ -111,7 +92,7 @@ def gen_vibration_data(sample_num):
     def clamp_region(x):
         return (
             np.isclose(x[0], Lx/2, atol=Lx/nx*2) &  # 중앙 x=0.5 ± 1cm
-            np.isclose(x[2], 0, atol=Lz/nz*2)  # 바닥
+            np.isclose(x[2], 0, atol=Lz/nz)  # 바닥
         )
 
     dofs_mass = fem.locate_dofs_geometrical(V, in_mass_block)
@@ -204,7 +185,7 @@ def gen_vibration_data(sample_num):
 
     if len(modes) == 0:
         raise RuntimeError("No valid modes found for modal superposition")
-    
+
     omega_r = 2*np.pi*np.array(freqs)   # rad/s
 
     omega = 2*np.pi*freq
@@ -308,14 +289,92 @@ def gen_vibration_data(sample_num):
     print("saved: params.txt")
 
 
-if __name__=="__main__":
-    total_samples=500
-    for i in range(total_samples):
-        print(f"Generating sample {i+1}/{total_samples}...")
-        while True:
-            try:
-                gen_vibration_data(i+262)
-                break
-            except RuntimeError as e:
-                print(f"Error generating sample {i}: {e}. Retrying...")
-    print("All samples generated.")
+
+    x_force = np.array([0.5, Ly/2, 0])   # 하중 위치
+    x_resp  = np.array([Lx, Ly/2, Lz])   # 응답 위치
+
+
+    coords = V.tabulate_dof_coordinates().reshape((-1, 3))
+
+    def find_nearest_dof(point):
+        return np.argmin(np.linalg.norm(coords - point, axis=1))
+
+    dof_f = find_nearest_dof(x_force)
+    dof_r = find_nearest_dof(x_resp)
+    Phi_f = []
+    Phi_r = []
+    modes = []     # ← 이게 modes
+    freqs = []     # 고유진동수도 같이 저장
+
+    for i in range(evs):
+        l = eigensolver.getEigenpair(i, vr, vi)
+
+        # 고유치 → 주파수
+        if l.real <= 0:
+            continue
+
+        freq = np.sqrt(l.real) / (2*np.pi)
+
+        # 저주파(강체모드) 컷
+        if freq < 5.0:
+            continue
+
+        # PETSc Vec → dolfinx Function
+        mode = Function(V)
+        mode.x.array[:] = vr.array[:] 
+        mode.name = f"mode_{i}"
+
+        modes.append(mode)
+        freqs.append(freq)
+
+        # print(f"Mode {i}: {freq:.2f} Hz")
+
+    omega_r = 2*np.pi*np.array(freqs)   # rad/s
+    for mode in modes:
+        u = mode.x.array.reshape((-1, 3))
+        Phi_f.append(u[dof_f, 2])   # 예: z방향
+        Phi_r.append(u[dof_r, 2])
+
+    Phi_f = np.array(Phi_f)
+    Phi_r = np.array(Phi_r)
+
+    fmin, fmax = 0.0, 4096.0
+    npts = 4096
+    freq = np.linspace(fmin, fmax, npts)
+    omega = 2*np.pi*freq
+
+    # zeta = 0.001   # 1% modal damping
+
+    H = np.zeros_like(omega, dtype=complex)
+
+    for r in range(len(omega_r)):
+        num = Phi_r[r] * Phi_f[r]
+        den = (omega_r[r]**2 - omega**2
+            + 2j*zeta*omega_r[r]*omega)
+        H += num / den
+
+
+    return df[['x','y','z']],df[['ux','uy','uz']],df_cells,(freq, np.abs(H))
+
+if __name__ == "__main__":
+    sample_num=0
+    Lx=0.8
+    Ly=0.2
+    Lz=0.2
+    nx=40
+    ny=10
+    nz=10
+    xm0  = 0.5
+    xm1= xm0+Lx/nx*2
+    ym0= 0.01
+    ym1 = ym0+Ly/ny*2
+    zm0= 0
+    zm1 = zm0+Lz/nz*2
+    E = 210e9
+    nu = 0.3
+    rho = 7850.0
+    m_add=50
+    freq=180
+    a_base=1.5
+    zeta=0.001
+    get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu,rho,m_add,freq,a_base,zeta)

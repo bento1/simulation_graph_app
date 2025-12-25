@@ -2,7 +2,7 @@
 import os, json
 import numpy as np
 import pandas as pd
-from utils import feature_normalize
+from utils import feature_normalize,minmax_scale
 import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
@@ -77,61 +77,87 @@ class FemGraphDataset(Dataset):
             if os.path.isdir(os.path.join(root_dir, d))
         ])
         self.data_list = []
+        self.scale_info={}
+        for sd in tqdm(self.samples):
+            self.find_data_info(sd)
         print("Loading FEM graph dataset...")
         for sd in tqdm(self.samples):
             full_data = self._load_full_graph(sd)
             subgraphs = self._split_graph(full_data, 500)
             self.data_list.extend(subgraphs)
         print("Build Complete FEM graph dataset...")
+    def find_data_info(self,sd):
+        disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
+        with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
+            params = json.load(f)
+        for key in ["x","y","z","ux","uy","uz"]:
+            min_value=disp_df[key].min()
+            max_value=disp_df[key].max()
+            if key not in self.scale_info:
+                self.scale_info[key]={'min':min_value,'max':max_value}
+            else:
+                if min_value<self.scale_info[key]['min']:
+                    self.scale_info[key]['min']=min_value
+                if max_value>self.scale_info[key]['max']:
+                    self.scale_info[key]['max']=max_value
+
+        for key in params:
+            if key not in self.scale_info:
+                self.scale_info[key]={'min':params[key],'max':params[key]}
+            else:
+                if params[key]<self.scale_info[key]['min']:
+                    self.scale_info[key]['min']=params[key]
+                if params[key]>self.scale_info[key]['max']:
+                    self.scale_info[key]['max']=params[key]            
 
     def len(self):
         return len(self.data_list)
     
-    # def _split_graph(self, data: Data, max_nodes=2000):
-    #     subgraphs = []
-    #     N = data.num_nodes
-    #     perm = torch.randperm(N)
-
-    #     for i in range(0, N, max_nodes):
-    #         idx = perm[i:i+max_nodes]
-    #         sub = data.subgraph(idx)
-    #         subgraphs.append(sub)
-
-    #     return subgraphs
-    def _split_graph(self, data: Data, max_nodes=2000, k_halo=2):
-        """
-        Overlap subgraph:
-        - core: max_nodes 개
-        - halo: k_halo-hop 이웃
-        """
+    def _split_graph(self, data: Data, max_nodes=2000):
         subgraphs = []
         N = data.num_nodes
         perm = torch.randperm(N)
 
         for i in range(0, N, max_nodes):
-            seed = perm[i:i+max_nodes]
-
-            # k_halo hop 확장 (core + halo)
-            nodes, edge_index, mapping, edge_mask = k_hop_subgraph(
-                seed,
-                k_halo,
-                data.edge_index,
-                relabel_nodes=True,
-                num_nodes=N
-            )
-
-            # subgraph 생성
-            sub = data.subgraph(nodes)
-
-            # core mask (subgraph 기준)
-            core_mask = torch.zeros(sub.num_nodes, dtype=torch.bool)
-            # mapping: seed -> subgraph index
-            core_mask[mapping] = True
-            sub.core_mask = core_mask
-
+            idx = perm[i:i+max_nodes]
+            sub = data.subgraph(idx)
             subgraphs.append(sub)
 
         return subgraphs
+    # def _split_graph(self, data: Data, max_nodes=2000, k_halo=2):
+    #     """
+    #     Overlap subgraph:
+    #     - core: max_nodes 개
+    #     - halo: k_halo-hop 이웃
+    #     """
+    #     subgraphs = []
+    #     N = data.num_nodes
+    #     perm = torch.randperm(N)
+
+    #     for i in range(0, N, max_nodes):
+    #         seed = perm[i:i+max_nodes]
+
+    #         # k_halo hop 확장 (core + halo)
+    #         nodes, edge_index, mapping, edge_mask = k_hop_subgraph(
+    #             seed,
+    #             k_halo,
+    #             data.edge_index,
+    #             relabel_nodes=True,
+    #             num_nodes=N
+    #         )
+
+    #         # subgraph 생성
+    #         sub = data.subgraph(nodes)
+
+    #         # core mask (subgraph 기준)
+    #         core_mask = torch.zeros(sub.num_nodes, dtype=torch.bool)
+    #         # mapping: seed -> subgraph index
+    #         core_mask[mapping] = True
+    #         sub.core_mask = core_mask
+
+    #         subgraphs.append(sub)
+
+    #     return subgraphs
 
     def _load_full_graph(self, sd):
 
@@ -139,11 +165,10 @@ class FemGraphDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        params,Lx, Ly, Lz = feature_normalize(params)
+        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
+        for key in ["x","y","z","ux","uy","uz"]:
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
-        xyz[:,0] = xyz[:,0]/Lx
-        xyz[:,1] = xyz[:,1]/Ly
-        xyz[:,2] = xyz[:,2]/Lz
         y = disp_df[["ux","uy","uz"]].to_numpy(dtype=np.float32)
 
         x = build_node_features(xyz, params)  # [N,F]
@@ -173,7 +198,65 @@ class FemGraphDataset(Dataset):
         
     def get(self, idx):
         return self.data_list[idx]
+class FemGraphInferenceDataset(Dataset):
+    def __init__(self, root_dir: str, scale_info:dict, knn_k: int = 12, use_cell_edges: bool = True):
+        super().__init__()
+        self.root_dir = root_dir
+        self.knn_k = knn_k
+        self.use_cell_edges = use_cell_edges
+        self.samples = sorted([
+            os.path.join(root_dir, d) for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ])
+        self.data_list = []
+        self.scale_info=scale_info
+
+        print("Loading FEM graph dataset...")
+        for sd in tqdm(self.samples):
+            full_data = self._load_full_graph(sd)
+            self.data_list.append(full_data)
+        print("Build Complete FEM graph dataset...")
     
+    def len(self):
+        return len(self.data_list)
+    
+    def _load_full_graph(self, sd):
+
+        disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
+        with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
+            params = json.load(f)
+        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
+        for key in ["x","y","z"]:
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
+        xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
+
+        x = build_node_features(xyz, params)  # [N,F]
+
+        # edges: cell + knn 혼합
+        edges = []
+        if self.use_cell_edges and os.path.exists(os.path.join(sd, "edge_infos.csv")):
+            cells_df = pd.read_csv(os.path.join(sd, "edge_infos.csv"))
+            edges.append(cells_to_edges(cells_df, undirected=True))
+        edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
+
+        edges = np.vstack(edges)
+        edges = np.unique(edges, axis=0)
+
+        edge_index = torch.from_numpy(edges).t().contiguous()  # [2,E]
+
+        data = Data(
+            x=torch.from_numpy(x),
+            #y=torch.from_numpy(y),
+            pos=torch.from_numpy(xyz),   # pos는 따로 보관(편함)
+            edge_index=edge_index
+        )
+
+        # edge_attr 생성
+        data.edge_attr = build_edge_attr(data.edge_index, data.pos,Lx, Ly, Lz)
+        return data
+        
+    def get(self, idx):
+        return self.data_list[idx]
 if __name__ == "__main__":
     root = "./data"
     ds = FemGraphDataset(root_dir=root, knn_k=12, use_cell_edges=True)
