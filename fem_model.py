@@ -53,6 +53,7 @@ class MeshGNN(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, out_dim),
+            nn.ReLU(),
         )
 
     def forward(self, data: Data):

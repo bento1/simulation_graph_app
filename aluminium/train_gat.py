@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch
 from torch_geometric.loader import DataLoader
 from fem_dataset import FemGraphDataset
-from fem_model import MeshGNN
+from fem_model import MeshGNN_GAT
 from tqdm import tqdm
 from utils import EarlyStopping
 
@@ -66,8 +66,9 @@ def main():
 
     model_param={'in_dim':example.x.shape[1],
             'edge_dim':4,
-            'hidden':128,
-            'layers':8,
+            'hidden':512,
+            'layers':16,
+            'head':8,
             'out_dim':9,
             'dropout':0.1,
             'dataset_scale_info':ds.scale_info,
@@ -75,10 +76,11 @@ def main():
             'learning_rate':1e-4
             }
     
-    model = MeshGNN(in_dim=model_param['in_dim'],
+    model = MeshGNN_GAT(in_dim=model_param['in_dim'],
                 edge_dim=model_param['edge_dim'],
                 hidden=model_param['hidden'],
                 layers=model_param['layers'],
+                heads=model_param['head'],
                 out_dim=model_param['out_dim'],
                 dropout=model_param['dropout']).to(device)
     
@@ -97,10 +99,10 @@ def main():
 
         if improved:
             best_val = va
-            torch.save(model.state_dict(), "mesh_invariant_gnn_early.pt")  # best만 저장
-            with open(f"loss_history_early.json", "w", encoding="utf-8") as f:
+            torch.save(model.state_dict(), "mesh_invariant_gat_early.pt")  # best만 저장
+            with open(f"loss_history_gat_early.json", "w", encoding="utf-8") as f:
                 json.dump(loss_dict, f, indent=2)
-            with open(f"model_param_early.json", "w", encoding="utf-8") as f:
+            with open(f"model_param_gat_early.json", "w", encoding="utf-8") as f:
                 json.dump(model_param, f, indent=2)
         if early_stopping.should_stop:
             print(
@@ -108,11 +110,11 @@ def main():
                 f"(best val = {best_val:.6e})"
             )
             break
-    torch.save(model.state_dict(), "mesh_invariant_gnn.pt")
-    print("saved: mesh_invariant_gnn.pt")
-    with open(f"loss_history.json", "w", encoding="utf-8") as f:
+    torch.save(model.state_dict(), "mesh_invariant_gat.pt")
+    print("saved: mesh_invariant_gat.pt")
+    with open(f"loss_history_gat.json", "w", encoding="utf-8") as f:
         json.dump(loss_dict, f, indent=2)
-    with open(f"model_param.json", "w", encoding="utf-8") as f:
+    with open(f"model_param_gat.json", "w", encoding="utf-8") as f:
         json.dump(model_param, f, indent=2)
 if __name__ == "__main__":
     main()

@@ -79,12 +79,21 @@ class FemGraphDataset(Dataset):
         self.data_list = []
         self.scale_info={}
         for sd in tqdm(self.samples):
-            self.find_data_info(sd)
+            try:
+                self.find_data_info(sd)
+            except Exception as e:
+                print(f"Error in finding data info for sample {sd}: {e}")
+                continue
         print("Loading FEM graph dataset...")
         for sd in tqdm(self.samples):
-            full_data = self._load_full_graph(sd)
-            subgraphs = self._split_graph(full_data, 500)
-            self.data_list.extend(subgraphs)
+            try:
+                full_data = self._load_full_graph(sd)
+                subgraphs = self._split_graph(full_data, 500)
+                self.data_list.extend(subgraphs)
+            except Exception as e:
+                print(f"Error in loading graph for sample {sd}: {e}")
+                continue
+
         print("Build Complete FEM graph dataset...")
     def find_data_info(self,sd):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
@@ -124,40 +133,6 @@ class FemGraphDataset(Dataset):
             subgraphs.append(sub)
 
         return subgraphs
-    # def _split_graph(self, data: Data, max_nodes=2000, k_halo=2):
-    #     """
-    #     Overlap subgraph:
-    #     - core: max_nodes 개
-    #     - halo: k_halo-hop 이웃
-    #     """
-    #     subgraphs = []
-    #     N = data.num_nodes
-    #     perm = torch.randperm(N)
-
-    #     for i in range(0, N, max_nodes):
-    #         seed = perm[i:i+max_nodes]
-
-    #         # k_halo hop 확장 (core + halo)
-    #         nodes, edge_index, mapping, edge_mask = k_hop_subgraph(
-    #             seed,
-    #             k_halo,
-    #             data.edge_index,
-    #             relabel_nodes=True,
-    #             num_nodes=N
-    #         )
-
-    #         # subgraph 생성
-    #         sub = data.subgraph(nodes)
-
-    #         # core mask (subgraph 기준)
-    #         core_mask = torch.zeros(sub.num_nodes, dtype=torch.bool)
-    #         # mapping: seed -> subgraph index
-    #         core_mask[mapping] = True
-    #         sub.core_mask = core_mask
-
-    #         subgraphs.append(sub)
-
-    #     return subgraphs
 
     def _load_full_graph(self, sd):
 
@@ -166,10 +141,10 @@ class FemGraphDataset(Dataset):
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
-        for key in ["x","y","z","sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]:
+        for key in ["x","y","z","ux","uy","uz"]:
             disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
-        y = disp_df[["sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]].to_numpy(dtype=np.float32)
+        y = disp_df[["ux","uy","uz"]].to_numpy(dtype=np.float32)
 
         x = build_node_features(xyz, params)  # [N,F]
 
@@ -178,7 +153,7 @@ class FemGraphDataset(Dataset):
         if self.use_cell_edges and os.path.exists(os.path.join(sd, "edge_infos.csv")):
             cells_df = pd.read_csv(os.path.join(sd, "edge_infos.csv"))
             edges.append(cells_to_edges(cells_df, undirected=True))
-        edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
+        # edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
 
         edges = np.vstack(edges)
         edges = np.unique(edges, axis=0)
@@ -226,7 +201,7 @@ class FemGraphInferenceDataset(Dataset):
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
-        for key in ["x","y","z"]:
+        for key in ["x","y","z",]:
             disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
 
@@ -237,7 +212,7 @@ class FemGraphInferenceDataset(Dataset):
         if self.use_cell_edges and os.path.exists(os.path.join(sd, "edge_infos.csv")):
             cells_df = pd.read_csv(os.path.join(sd, "edge_infos.csv"))
             edges.append(cells_to_edges(cells_df, undirected=True))
-        edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
+        # edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
 
         edges = np.vstack(edges)
         edges = np.unique(edges, axis=0)

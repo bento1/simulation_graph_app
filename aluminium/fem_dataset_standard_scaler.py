@@ -2,7 +2,7 @@
 import os, json
 import numpy as np
 import pandas as pd
-from utils import feature_normalize,minmax_scale
+from utils import feature_standard_normalize,standard_scale
 import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
@@ -79,37 +79,69 @@ class FemGraphDataset(Dataset):
         self.data_list = []
         self.scale_info={}
         for sd in tqdm(self.samples):
-            self.find_data_info(sd)
+            try:
+                self.find_data_info(sd)
+            except Exception as e:
+                print(f"Error in finding data info for {sd}: {e}")
+                continue
         print("Loading FEM graph dataset...")
         for sd in tqdm(self.samples):
-            full_data = self._load_full_graph(sd)
-            subgraphs = self._split_graph(full_data, 500)
-            self.data_list.extend(subgraphs)
+            try:
+                full_data = self._load_full_graph(sd)
+                subgraphs = self._split_graph(full_data, 100)
+                self.data_list.extend(subgraphs)
+            except Exception as e:
+                print(f"Error in loading graph for {sd}: {e}")
+                continue
+            # break
         print("Build Complete FEM graph dataset...")
+    
     def find_data_info(self,sd):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
         for key in ["x","y","z","sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]:
+            mean_value=disp_df[key].mean()
+            std_value=disp_df[key].std()
+            num_data=disp_df[key].shape[0]
             min_value=disp_df[key].min()
             max_value=disp_df[key].max()
             if key not in self.scale_info:
-                self.scale_info[key]={'min':min_value,'max':max_value}
+                self.scale_info[key]={'min':min_value,'max':max_value,'mean':mean_value,'std':std_value,'num':num_data}
             else:
-                if min_value<self.scale_info[key]['min']:
+                if min_value<=self.scale_info[key]['min']:
                     self.scale_info[key]['min']=min_value
                 if max_value>self.scale_info[key]['max']:
                     self.scale_info[key]['max']=max_value
+                prev_mean=self.scale_info[key]['mean']
+                prev_num=self.scale_info[key]['num']
+                prev_std=self.scale_info[key]['std']
+                self.scale_info[key]['mean']= (mean_value*num_data+ self.scale_info[key]['mean']*self.scale_info[key]['num'])/(num_data+self.scale_info[key]['num'])
+                self.scale_info[key]['std']=np.sqrt(((num_data-1)*std_value**2 + \
+                                                    (prev_num-1)*prev_std**2+ \
+                                                    num_data*(mean_value-self.scale_info[key]['mean'])**2+ \
+                                                    prev_num*(prev_mean-self.scale_info[key]['mean'])**2)/ (num_data +prev_num -1))
+                self.scale_info[key]['num']+=num_data
 
         for key in params:
+            num_data=1
             if key not in self.scale_info:
-                self.scale_info[key]={'min':params[key],'max':params[key]}
+                self.scale_info[key]={'min':params[key],'max':params[key],'mean':params[key],'std':0,'num':1}
             else:
                 if params[key]<self.scale_info[key]['min']:
                     self.scale_info[key]['min']=params[key]
                 if params[key]>self.scale_info[key]['max']:
                     self.scale_info[key]['max']=params[key]            
-
+                prev_mean=self.scale_info[key]['mean']
+                prev_num=self.scale_info[key]['num']
+                prev_std=self.scale_info[key]['std']
+                self.scale_info[key]['mean']= prev_mean+(params[key]-prev_mean)/(prev_num+1)
+                del1=params[key]-prev_mean
+                del2=params[key]-self.scale_info[key]['mean']
+                M2=prev_std**2 * (prev_num -1) + del1 * del2
+                self.scale_info[key]['std']=np.sqrt(M2/(self.scale_info[key]['num']-1)) if self.scale_info[key]['num']>1 else 0
+                self.scale_info[key]['num']+=num_data
+    
     def len(self):
         return len(self.data_list)
     
@@ -124,40 +156,6 @@ class FemGraphDataset(Dataset):
             subgraphs.append(sub)
 
         return subgraphs
-    # def _split_graph(self, data: Data, max_nodes=2000, k_halo=2):
-    #     """
-    #     Overlap subgraph:
-    #     - core: max_nodes 개
-    #     - halo: k_halo-hop 이웃
-    #     """
-    #     subgraphs = []
-    #     N = data.num_nodes
-    #     perm = torch.randperm(N)
-
-    #     for i in range(0, N, max_nodes):
-    #         seed = perm[i:i+max_nodes]
-
-    #         # k_halo hop 확장 (core + halo)
-    #         nodes, edge_index, mapping, edge_mask = k_hop_subgraph(
-    #             seed,
-    #             k_halo,
-    #             data.edge_index,
-    #             relabel_nodes=True,
-    #             num_nodes=N
-    #         )
-
-    #         # subgraph 생성
-    #         sub = data.subgraph(nodes)
-
-    #         # core mask (subgraph 기준)
-    #         core_mask = torch.zeros(sub.num_nodes, dtype=torch.bool)
-    #         # mapping: seed -> subgraph index
-    #         core_mask[mapping] = True
-    #         sub.core_mask = core_mask
-
-    #         subgraphs.append(sub)
-
-    #     return subgraphs
 
     def _load_full_graph(self, sd):
 
@@ -165,11 +163,11 @@ class FemGraphDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
-        for key in ["x","y","z","sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
+        params,Lx, Ly, Lz = feature_standard_normalize(params,self.scale_info)
+        for key in ["x","y","z","ux","uy","uz"]:
+            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
-        y = disp_df[["sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]].to_numpy(dtype=np.float32)
+        y = disp_df[["ux","uy","uz"]].to_numpy(dtype=np.float32)
 
         x = build_node_features(xyz, params)  # [N,F]
 
@@ -178,7 +176,7 @@ class FemGraphDataset(Dataset):
         if self.use_cell_edges and os.path.exists(os.path.join(sd, "edge_infos.csv")):
             cells_df = pd.read_csv(os.path.join(sd, "edge_infos.csv"))
             edges.append(cells_to_edges(cells_df, undirected=True))
-        edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
+        # edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
 
         edges = np.vstack(edges)
         edges = np.unique(edges, axis=0)
@@ -225,9 +223,9 @@ class FemGraphInferenceDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
-        for key in ["x","y","z"]:
-            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
+        params,Lx, Ly, Lz = feature_standard_normalize(params,self.scale_info)
+        for key in ["x","y","z",]:
+            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
 
         x = build_node_features(xyz, params)  # [N,F]
@@ -237,7 +235,7 @@ class FemGraphInferenceDataset(Dataset):
         if self.use_cell_edges and os.path.exists(os.path.join(sd, "edge_infos.csv")):
             cells_df = pd.read_csv(os.path.join(sd, "edge_infos.csv"))
             edges.append(cells_to_edges(cells_df, undirected=True))
-        edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
+        # edges.append(knn_edges(xyz, k=self.knn_k, undirected=True))
 
         edges = np.vstack(edges)
         edges = np.unique(edges, axis=0)
