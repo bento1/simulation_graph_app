@@ -55,7 +55,7 @@ def main():
     ds = FemGraphDataset(root_dir=root, knn_k=12, use_cell_edges=True)
 
     n = len(ds)
-    n_train = int(n * 0.8)
+    n_train = int(n * 0.9)
     train_ds = ds[:n_train]
     val_ds = ds[n_train:]
 

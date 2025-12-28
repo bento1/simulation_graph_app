@@ -88,7 +88,7 @@ class FemGraphDataset(Dataset):
         for sd in tqdm(self.samples):
             try:
                 full_data = self._load_full_graph(sd)
-                subgraphs = self._split_graph(full_data, 500)
+                subgraphs = self._split_graph(full_data, 200)
                 self.data_list.extend(subgraphs)
             except Exception as e:
                 print(f"Error in loading graph for sample {sd}: {e}")
