@@ -18,6 +18,85 @@ import random
 import json
 
 # Convenience functions
+# Convenience functions
+def pick_measure_dof_near_point(V: fem.FunctionSpace, x0: np.ndarray, atol: float,
+                                component: int = 2) -> int:
+    """
+    FRF를 CSV로 뽑을 때 '관심점 근처'의 DOF 하나를 대표로 고른다.
+    (노드 정확히 일치가 아니라도 atol로 가장 가까운 것 찾는 느낌)
+    """
+    bs = V.dofmap.index_map_bs
+    assert bs == 3
+
+    def near_point(x):
+        return (np.isclose(x[0], x0[0], atol=atol) &
+                np.isclose(x[1], x0[1], atol=atol) &
+                np.isclose(x[2], x0[2], atol=atol))
+
+    cand = fem.locate_dofs_geometrical(V, near_point)
+    cand = [int(d) for d in cand if (int(d) % bs) == component]
+    if len(cand) == 0:
+        # fallback: 그냥 가장 가까운 노드를 찾는 건 dolfinx API로 바로는 애매해서,
+        # atol을 늘리는 걸 권장. 여기서는 안전하게 에러.
+        raise RuntimeError("No measurement DOF found near x0. Increase atol.")
+    return cand[0]
+
+def build_patch_force_vector(V: fem.FunctionSpace, x0: np.ndarray, patch_half: np.ndarray,
+                            F_total: float, component: int = 2) -> tuple[PETSc.Vec, np.ndarray]:
+    """
+    노드에 정확히 안 걸려도 되는 'patch 분포하중' 방식.
+    x0 중심, (±patch_half) 박스 영역 내 DOF들에 force를 분배.
+    - component: 0=x, 1=y, 2=z
+    - F_total: 전체 힘 (N)
+    반환: (f_vec, selected_dofs)
+    """
+    bs = V.dofmap.index_map_bs
+    assert bs == 3, "Vector P1 expected (bs=3)."
+
+    ndofs = V.dofmap.index_map.size_global * bs
+    comm = V.mesh.comm
+
+    # patch 안에 들어오는 dof 찾기 (geometrical)
+    x_min = x0 - patch_half
+    x_max = x0 + patch_half
+
+    def in_patch(x):
+        return ((x[0] >= x_min[0]) & (x[0] <= x_max[0]) &
+                (x[1] >= x_min[1]) & (x[1] <= x_max[1]) &
+                (x[2] >= x_min[2]) & (x[2] <= x_max[2]))
+
+    dofs_patch_all = fem.locate_dofs_geometrical(V, in_patch)
+
+    # 해당 component(z 등)에 해당하는 DOF만
+    dofs_patch = np.array([int(d) for d in dofs_patch_all if (int(d) % bs) == component], dtype=np.int32)
+
+    # MPI 환경에서 전체 개수 합산
+    n_local = np.array([len(dofs_patch)], dtype=np.int64)
+    n_global = np.array([0], dtype=np.int64)
+    comm.Allreduce(n_local, n_global, op=MPI.SUM)
+
+    if n_global[0] == 0:
+        raise RuntimeError(
+            f"No DOF in patch. Enlarge patch_half or move x0.\n"
+            f"x0={x0}, patch_half={patch_half}"
+        )
+
+    # 각 DOF에 분배할 힘 (전체 합이 F_total이 되도록)
+    f_each = F_total / float(n_global[0])
+
+    f = PETSc.Vec().createMPI(ndofs, comm=comm)
+    f.set(0.0)
+
+    # 소유 구간에 있는 DOF만 setValue (안전)
+    r0, r1 = f.getOwnershipRange()
+    for d in dofs_patch:
+        if r0 <= d < r1:
+            f.setValue(d, f_each)
+
+    f.assemblyBegin()
+    f.assemblyEnd()
+
+    return f, dofs_patch
 
 def get_von_mises(sx, sy, sz, txy, tyz, tzx):
     return np.sqrt(
@@ -89,23 +168,16 @@ def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu
         return ((x[0] >= xm0) & (x[0] <= xm1) &
                 (x[1] >= ym0) & (x[1] <= ym1) &
                 (x[2] >= zm0) & (x[2] <= zm1))
-    def clamp_region(x):
-        return (
-            np.isclose(x[0], Lx/2, atol=Lx/nx*2) &  # 중앙 x=0.5 ± 1cm
-            np.isclose(x[2], 0, atol=Lz/nz)  # 바닥
-        )
+
 
     dofs_mass = fem.locate_dofs_geometrical(V, in_mass_block)
-    dofs_clamp = fem.locate_dofs_geometrical(V, clamp_region)
-    zero = np.array([0.0, 0.0, 0.0], dtype=PETSc.ScalarType)
-    bc = fem.dirichletbc(zero, dofs_clamp, V)
-    bcs = [bc]
+
     if len(dofs_mass) == 0:
         raise RuntimeError("Mass block DOFs not found")
     ndofs = len(dofs_mass)
     m_per_dof = m_add / ndofs
 
-    K = fem.petsc.assemble_matrix(a_form, bcs=bcs, diagonal=1/62831)
+    K = fem.petsc.assemble_matrix(a_form, diagonal=1/62831)
     K.assemble()
 
     M = fem.petsc.assemble_matrix(m_form, diagonal=62831)
@@ -117,7 +189,7 @@ def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu
     M.assemble()
 
     # Create and configure eigenvalue solver
-    N_eig = 500
+    N_eig = 400
     eigensolver = SLEPc.EPS().create(MPI.COMM_WORLD)
     eigensolver.setDimensions(N_eig)
     eigensolver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
@@ -141,128 +213,92 @@ def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu
     ndofs = M.getSize()[0]
     bs = V.dofmap.index_map_bs
 
-    # ---- 베이스 영향 벡터 b (z방향) ----
-    b = PETSc.Vec().createMPI(ndofs, comm=M.comm)
-    b.set(0.0)
-
-    clamp_set = set(map(int, dofs_clamp))
-    r0, r1 = b.getOwnershipRange()
-    for dof in range(r0, r1):
-        if (dof % bs) == 2 and (dof not in clamp_set):
-            b.setValue(dof, 1.0)
-
-    b.assemblyBegin()
-    b.assemblyEnd()
-
-    Mb = M.createVecRight()
-    M.mult(b, Mb)
 
     # ---- 모달 중첩 ----
-    u_resp = np.zeros(ndofs, dtype=np.complex128)
+
 
     modes = []     # ← 이게 modes
     freqs = []     # 고유진동수도 같이 저장
 
     for i in range(evs):
-        l = eigensolver.getEigenpair(i, vr, vi)
-
-        # 고유치 → 주파수
-        if l.real <= 0:
+        lam_i = eigensolver.getEigenpair(i, vr, vi)
+        if lam_i.real <= 0:
             continue
 
-        _freq = np.sqrt(l.real) / (2*np.pi)
-
-        # 저주파(강체모드) 컷
-        if _freq < 5.0:
+        f_i = np.sqrt(lam_i.real) / (2.0 * np.pi)
+        if f_i < 5:
             continue
 
-        # PETSc Vec → dolfinx Function
-        mode = Function(V)
-        mode.x.array[:] = vr.array[:]  
-        mode.name = f"mode_{i}"
+        # Copy eigenvector into Function
+        mode = fem.Function(V)
+        mode.x.array[:] = vr.array[:]
+
+        # Create PETSc Vec view (local)
+        phi = PETSc.Vec().createWithArray(mode.x.array, comm=MPI.COMM_WORLD)
+
+        # mass norm = sqrt(phi^T M phi)
+        Mphi = M.createVecRight()
+        M.mult(phi, Mphi)
+        mnorm_sq = phi.dot(Mphi)
+        mnorm = np.sqrt(np.abs(mnorm_sq))
+
+        # Normalize (avoid division by 0)
+        if mnorm < 1e-30:
+            continue
+        mode.x.array[:] = mode.x.array[:] / mnorm
+
         modes.append(mode)
-        freqs.append(_freq)
+        freqs.append(float(f_i))
 
     if len(modes) == 0:
         raise RuntimeError("No valid modes found for modal superposition")
-
+    
     omega_r = 2*np.pi*np.array(freqs)   # rad/s
 
     omega = 2*np.pi*freq
+    x0 = np.array([Lx/2.0 , Ly / 2.0, 0.0], dtype=np.float64)
+    hx, hy, hz = Lx / nx, Ly / ny, Lz / nz
+    patch_half = np.array([2*hx, 2*hy, 2*hz])  # 충분히 작게
+
+    f_vec, dofs_patch = build_patch_force_vector(
+        V,
+        x0=x0,
+        patch_half=patch_half,
+        F_total=a_base,
+        component=2   # z 방향
+    )
+    modal_force = np.zeros(len(modes), dtype=np.complex128)
 
     for r, mode in enumerate(modes):
-        phi = PETSc.Vec().createWithArray(mode.x.array, comm=M.comm)
-        Fr = - phi.dot(Mb) * a_base
+        phi = PETSc.Vec().createWithArray(mode.x.array, comm=MPI.COMM_WORLD)
+        modal_force[r] = phi.dot(f_vec)   # ← ★ 이게 가진 효과
+
+
+
+
+
+    u_resp = np.zeros(ndofs, dtype=np.complex128)
+
+    for r, mode in enumerate(modes):
         den = (omega_r[r]**2 - omega**2) + 2j*zeta*omega_r[r]*omega
-        u_resp += (mode.x.array * Fr) / den
+        u_resp += (mode.x.array * modal_force[r]) / den
 
 
-    u_resp[np.array(dofs_clamp, dtype=np.int32)] = 0.0
-    
-    u_real = fem.Function(V)
-    u_real.name = f"u_real_{round(freq)}Hz"
-    u_real.x.array[:] = np.real(u_resp)
-
-
-    We = ufl.TensorElement("DG", domain.ufl_cell(), degree=0, shape=(3, 3))
-    W = fem.FunctionSpace(domain, We)
-
-    stress_cell = fem.Function(W)
-    stress_expr = fem.Expression(sigma(u_real), W.element.interpolation_points())
-    stress_cell.interpolate(stress_expr)
-    Wn = fem.FunctionSpace(
-        domain,
-        ufl.TensorElement("Lagrange", domain.ufl_cell(), 1, shape=(3,3))
-    )
-
-    stress_node = fem.Function(Wn)
-    stress_node.name = f"stress_{round(freq)}Hz"
-
-    w = ufl.TrialFunction(Wn)
-    v = ufl.TestFunction(Wn)
-
-    a_proj = ufl.inner(w, v) * ufl.dx
-    L_proj = ufl.inner(stress_cell, v) * ufl.dx
-
-    problem = fem.petsc.LinearProblem(
-        a_proj, L_proj,
-        u=stress_node,
-        petsc_options={"ksp_type": "cg", "pc_type": "jacobi"}
-    )
-    problem.solve()
-    S = stress_node.x.array.reshape((-1, 9))
-
-    sig_xx = S[:,0]
-    sig_yy = S[:,4]
-    sig_zz = S[:,8]
-
-    tau_xy = S[:,1]
-    tau_yz = S[:,5]
-    tau_zx = S[:,6]
     coords = domain.geometry.x
 
 
-    coords_nodes = domain.geometry.x
-    u_vec = u_real.x.array.reshape((-1, 3))  # NOTE: P1 vector면 "node 수"와 맞는 경우가 많지만, 안전하게는 아래 3.2를 권장
-
-
+    u_node = u_resp.reshape((-1, 3))  
     df = pd.DataFrame({
-        "node_id": np.arange(coords_nodes.shape[0]),
+        "node_id": np.arange(coords.shape[0]),
         "x": coords[:,0],
         "y": coords[:,1],
         "z": coords[:,2],
-        "sigma_xx": sig_xx,
-        "sigma_yy": sig_yy,
-        "sigma_zz": sig_zz,
-        "tau_xy": tau_xy,
-        "tau_yz": tau_yz,
-        "tau_zx": tau_zx,
-        "ux": u_vec[:,0],
-        "uy": u_vec[:,1],
-        "uz": u_vec[:,2],
-    })
-    df['von_mises'] = df.apply(lambda x:get_von_mises(x['sigma_xx'], x['sigma_yy'], x['sigma_zz'],
-                                                    x['tau_xy'], x['tau_yz'], x['tau_zx']), axis=1)
+        "ux": np.real(u_node[:,0]),
+        "uy": np.real(u_node[:,1]),
+        "uz": np.real(u_node[:,2]),
+        "ux_abs": np.abs(u_node[:,0]),
+        "uy_abs": np.abs(u_node[:,1]),
+        "uz_abs": np.abs(u_node[:,2]),})
     df.to_csv(f"{path}/nodal_stress_disp.csv", index=False)
     print("saved: nodal_stress_disp.csv")
 
@@ -287,7 +323,14 @@ def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu
     with open(f"{path}/params.json", "w", encoding="utf-8") as f:
         json.dump(params, f, indent=2)
     print("saved: params.txt")
-
+    if 'eigensolver' in locals():
+        eigensolver.destroy()
+    if 'st' in locals():
+        st.destroy()
+    if 'K' in locals():
+        K.destroy()
+    if 'M' in locals():
+        M.destroy()
 
 
     x_force = np.array([0.5, Ly/2, 0])   # 하중 위치
@@ -301,35 +344,10 @@ def get_vibration_data(sample_num,Lx,Ly,Lz,nx,ny,nz,xm0,xm1,ym0,ym1,zm0,zm1,E,nu
 
     dof_f = find_nearest_dof(x_force)
     dof_r = find_nearest_dof(x_resp)
-    Phi_f = []
-    Phi_r = []
-    modes = []     # ← 이게 modes
-    freqs = []     # 고유진동수도 같이 저장
 
-    for i in range(evs):
-        l = eigensolver.getEigenpair(i, vr, vi)
-
-        # 고유치 → 주파수
-        if l.real <= 0:
-            continue
-
-        freq = np.sqrt(l.real) / (2*np.pi)
-
-        # 저주파(강체모드) 컷
-        if freq < 5.0:
-            continue
-
-        # PETSc Vec → dolfinx Function
-        mode = Function(V)
-        mode.x.array[:] = vr.array[:] 
-        mode.name = f"mode_{i}"
-
-        modes.append(mode)
-        freqs.append(freq)
-
-        # print(f"Mode {i}: {freq:.2f} Hz")
-    
     omega_r = 2*np.pi*np.array(freqs)   # rad/s
+    Phi_f=[]
+    Phi_r=[]
     for mode in modes:
         u = mode.x.array.reshape((-1, 3))
         Phi_f.append(u[dof_f, 2])   # 예: z방향
