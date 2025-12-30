@@ -10,12 +10,16 @@ def makeFolder(folder_path):
     return False
 
 def minmax_scale(params,__min,__max):
+    if __max==0:
+        return 0
     if __max - __min ==0:
         return params/__max/2
     scaled = (params - __min) / (__max - __min)
     return scaled
 
 def inverse_minmax_scale(scaled,__min,__max):
+    if __max==0:
+        return 0
     if __max - __min ==0:
         return params*__max*2
     params = scaled* (__max - __min) +__min
@@ -54,12 +58,16 @@ def feature_normalize(params,scale_info):
 
 
 def standard_scale(params,__std,__mean,__max):
+    if __max==0:
+        return 0
     if __std ==0:
         return params/__max/2
     scaled = (params - __mean) / (__std)
     return scaled
 
 def inverse_standard_scale(scaled,__std,__mean,__max):
+    if __max==0:
+        return 0
     if __std ==0:
         return params*__max*2
     params = scaled*__std +__mean

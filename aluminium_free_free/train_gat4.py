@@ -5,8 +5,8 @@ import pandas as pd
 import torch.nn.functional as F
 import torch
 from torch_geometric.loader import DataLoader
-from fem_dataset import FemGraphDataset
-from fem_model import MeshGNN_GAT2
+from fem_dataset_standard_scaler import FemGraphDataset
+from fem_model import MeshGNN_GAT4
 from tqdm import tqdm
 from utils import EarlyStopping
 
@@ -15,7 +15,7 @@ early_stopping = EarlyStopping(
     min_delta=1e-6,  # loss 스케일에 맞게
     mode="min"
 )
-
+eps = 1e-8
 best_val = float("inf")
 def train_one_epoch(model, loader, opt, device, loss_scale):
     model.train()
@@ -23,7 +23,7 @@ def train_one_epoch(model, loader, opt, device, loss_scale):
     for i,batch in enumerate(loader):
         batch = batch.to(device)
         pred = model(batch)
-        loss = F.mse_loss(pred, batch.y)*loss_scale
+        loss = torch.sqrt(F.mse_loss(pred, batch.y) + eps)*loss_scale
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -38,7 +38,7 @@ def eval_one_epoch(model, loader, device,loss_scale):
     for batch in loader:
         batch = batch.to(device)
         pred = model(batch)
-        loss = F.mse_loss(pred, batch.y )*loss_scale
+        loss = torch.sqrt(F.mse_loss(pred, batch.y) + eps)*loss_scale
         total += float(loss.item())
     return total / max(1, len(loader))
 
@@ -59,24 +59,24 @@ def main():
     train_ds = ds[:n_train]
     val_ds = ds[n_train:]
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False)
 
     example = ds[0]
 
     model_param={'in_dim':example.x.shape[1],
             'edge_dim':4,
-            'hidden':128,
+            'hidden':256,
             'layers':32,
-            'head':32,
+            'head':4,
             'out_dim':3,
-            'dropout':0.01,
+            'dropout':0.001,
             'dataset_scale_info':ds.scale_info,
             'loss_scale':1.0,
-            'learning_rate':1e-3
+            'learning_rate':1e-4
             }
     
-    model = MeshGNN_GAT2(in_dim=model_param['in_dim'],
+    model = MeshGNN_GAT4(in_dim=model_param['in_dim'],
                 edge_dim=model_param['edge_dim'],
                 hidden=model_param['hidden'],
                 layers=model_param['layers'],
@@ -85,8 +85,9 @@ def main():
                 dropout=model_param['dropout']).to(device)
     
     opt = torch.optim.AdamW(model.parameters(), lr=model_param['learning_rate'], weight_decay=1e-6)
-
-
+    if os.path.exists(f"mesh_invariant_gat4_early.pt"):
+        checkpoint = torch.load(f"mesh_invariant_gat4_early.pt", map_location=device)
+        model.load_state_dict(checkpoint)
     loss_dict={}
     for epoch in tqdm(range(1, 1000)):
         tr = train_one_epoch(model, train_loader, opt, device,model_param['loss_scale'])
@@ -99,10 +100,10 @@ def main():
 
         if improved:
             best_val = va
-            torch.save(model.state_dict(), "mesh_invariant_gat2_early.pt")  # best만 저장
-            with open(f"loss_history_gat2_early.json", "w", encoding="utf-8") as f:
+            torch.save(model.state_dict(), "mesh_invariant_gat4_early.pt")  # best만 저장
+            with open(f"loss_history_gat4_early.json", "w", encoding="utf-8") as f:
                 json.dump(loss_dict, f, indent=2)
-            with open(f"model_param_gat2_early.json", "w", encoding="utf-8") as f:
+            with open(f"model_param_gat4_early.json", "w", encoding="utf-8") as f:
                 json.dump(model_param, f, indent=2)
         if early_stopping.should_stop:
             print(
@@ -110,11 +111,11 @@ def main():
                 f"(best val = {best_val:.6e})"
             )
             break
-    torch.save(model.state_dict(), "mesh_invariant_gat2.pt")
-    print("saved: mesh_invariant_gat2.pt")
-    with open(f"loss_history_gat2.json", "w", encoding="utf-8") as f:
+    torch.save(model.state_dict(), "mesh_invariant_gat4.pt")
+    print("saved: mesh_invariant_gat4.pt")
+    with open(f"loss_history_gat4.json", "w", encoding="utf-8") as f:
         json.dump(loss_dict, f, indent=2)
-    with open(f"model_param_gat2.json", "w", encoding="utf-8") as f:
+    with open(f"model_param_gat4.json", "w", encoding="utf-8") as f:
         json.dump(model_param, f, indent=2)
 if __name__ == "__main__":
     main()

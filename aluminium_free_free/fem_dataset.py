@@ -99,7 +99,7 @@ class FemGraphDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        for key in ["x","y","z","sigma_xx","sigma_yy","sigma_zz","tau_xy","tau_yz","tau_zx","ux","uy","uz"]:
+        for key in ["x","y","z","ux","uy","uz","ux_abs","uy_abs","uz_abs"]:
             min_value=disp_df[key].min()
             max_value=disp_df[key].max()
             if key not in self.scale_info:
@@ -141,7 +141,7 @@ class FemGraphDataset(Dataset):
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(params,self.scale_info)
-        for key in ["x","y","z","ux","uy","uz"]:
+        for key in ["x","y","z","ux","uy","uz","ux_abs","uy_abs","uz_abs"]:
             disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
         y = disp_df[["ux","uy","uz"]].to_numpy(dtype=np.float32)

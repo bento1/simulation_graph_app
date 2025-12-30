@@ -353,12 +353,12 @@ def gen_vibration_data(sample_num):
 
 
 if __name__=="__main__":
-    total_samples=400
+    total_samples=600
     for i in range(total_samples):
         print(f"Generating sample {i+1}/{total_samples}...")
         while True:
             try:
-                gen_vibration_data(i)
+                gen_vibration_data(i+400)
                 break
             except RuntimeError as e:
                 print(f"Error generating sample {i}: {e}. Retrying...")

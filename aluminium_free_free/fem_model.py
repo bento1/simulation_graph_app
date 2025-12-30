@@ -157,11 +157,12 @@ class EdgeGAT2Block(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden)
         self.dropout = dropout
-
+        self.tanh= nn.Tanh()
     def forward(self, x, edge_index, edge_attr):
         h = self.gat(x, edge_index, edge_attr)
         h = F.dropout(h, p=self.dropout, training=self.training)
-        return self.norm(x + h)   # residual
+        h=  self.norm(x + h) 
+        return  self.tanh(h)# residual
 
 class MeshGNN_GAT2(nn.Module):
     def __init__(
@@ -260,6 +261,53 @@ class MeshGNN_GAT3(nn.Module):
 
         self.blocks = nn.ModuleList([
             EdgeGAT3Block(
+                hidden=hidden,
+                edge_dim=edge_dim,
+                heads=heads,
+                dropout=dropout,
+            )
+            for _ in range(layers)
+        ])
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.Tanh() ,
+            nn.Dropout(dropout),
+            nn.BatchNorm1d(hidden),
+            nn.Linear(hidden, out_dim),
+            # nn.ELU() ,  # FEM displacement / stress 양수일 때
+        )
+        self.tanh=nn.Tanh()
+        self.bn1 = torch.nn.BatchNorm1d(hidden)
+    def forward(self, data: Data):
+        x = self.lin_in(data.x)
+        x = self.bn1(x)
+        for block in self.blocks:
+            x = block(x, data.edge_index, data.edge_attr)
+        x = self.head(x)
+        return self.tanh(x)
+    
+class MeshGNN_GAT4(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        edge_dim=4,
+        hidden=128,
+        layers=6,
+        heads=8,
+        out_dim=3,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.lin_in = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.Tanh(),
+            nn.LayerNorm(hidden),
+        )
+
+        self.blocks = nn.ModuleList([
+            EdgeGAT2Block(
                 hidden=hidden,
                 edge_dim=edge_dim,
                 heads=heads,
