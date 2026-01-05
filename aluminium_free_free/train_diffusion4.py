@@ -138,9 +138,9 @@ def train_one_epoch(model, loader, device, opt, sched, model_param):
                 pred_image = sample_image(model, cond, sched,(1,model_param['in_channels'],model_param['GRID'],model_param['GRID']), device) 
                 pred_image=pred_image[0,:][(model_param['in_channels']-1)//2] 
                 draw(origin_image,pred_image,model_param)
-                del batch 
-                gc.collect() 
-                return total / max(1, count)
+        del batch 
+        gc.collect() 
+    return total / max(1, count)
 
 @torch.no_grad()
 def eval_one_epoch(model, loader, device,  sched,model_param):
@@ -162,9 +162,9 @@ def eval_one_epoch(model, loader, device,  sched,model_param):
                 pred_image = sample_image(model, cond, sched,(1,model_param['in_channels'],model_param['GRID'],model_param['GRID']), device) 
                 pred_image=pred_image[0,:][(model_param['in_channels']-1)//2] 
                 draw(origin_image,pred_image,model_param)
-                del batch 
-                gc.collect() 
-                return total / max(1, count)
+        del batch 
+        gc.collect() 
+    return total / max(1, count)
 
 def main():
     root = "./data"
