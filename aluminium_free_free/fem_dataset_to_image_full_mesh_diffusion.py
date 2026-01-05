@@ -2,7 +2,7 @@
 import os, json
 import numpy as np
 import pandas as pd
-from utils import feature_normalize,minmax_scale
+from utils import feature_normalize,minmax_scale,standard_scale
 import torch
 from torch.utils.data import Dataset
 # from torch_geometric.data import Data, Dataset
@@ -240,21 +240,21 @@ class FemImageDataset(Dataset):
             origin_params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(copy(origin_params),self.scale_info)
         for key in ["ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
-        z_idx = np.random.randint(0, self.GRID)
-        K=int((self.in_channels-1)/2)
-        image=csvToImage_25d_stack(disp_df, z_idx, K=K,GRID=self.GRID,scale=origin_params)
+            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+        vols=[] 
+        params_lists=[] 
+        for z_idx in range(self.GRID): 
+            # z_idx = np.random.randint(0, self.GRID) 
+            K=int((self.in_channels-1)/2) 
+            image=csvToImage_25d_stack(disp_df, z_idx, K=K,GRID=self.GRID,scale=origin_params) 
+            # image: (W,H,D,C) numpy 
+            vol = torch.from_numpy(image).float() 
+            vols.append(vol) 
+            params_list=[params[k] for k in sorted(params)] 
+            params_list=[z_idx/self.GRID]+params_list 
+            params_lists.append(params_list) 
 
-        # image: (W,H,D,C) numpy
-        vol = torch.from_numpy(image).float()
-
-        params_list=[params[k] for k in sorted(params)]
-        params_list=[z_idx/self.GRID]+params_list
-        data={
-            "image":vol,
-            "cond":torch.Tensor(params_list),
-            "slice_z_idx": torch.tensor([z_idx]),
-        }
+        data={ "image":vols, "cond":params_lists} # "slice_z_idx": torch.tensor([z_idx]), }
 
 
         return data
@@ -292,7 +292,7 @@ class FemImageInferenceDataset(Dataset):
             origin_params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(copy(origin_params),self.scale_info)
         for key in ["ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max']))
+            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
         z_idx = np.random.randint(0, self.GRID)
         # K=int((self.in_channels-1)/2)
         # image=csvToImage_25d_stack(disp_df, z_idx, K=K,GRID=self.GRID,scale=origin_params)

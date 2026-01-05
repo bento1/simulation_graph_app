@@ -1028,3 +1028,286 @@ class ContextUnet3D(nn.Module):
 
         out = self.out(torch.cat((u3, x0), dim=1))
         return out
+
+def sinusoidal_time_embedding(t: torch.Tensor, dim: int, max_period: int = 10000):
+    if t.dtype != torch.float32:
+        t = t.float()
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=t.device).float() / half)
+    args = t[:, None] * freqs[None, :]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
+
+class GroupNorm32(nn.Module):
+    def __init__(self, num_channels: int, num_groups: int = 32):
+        super().__init__()
+        g = min(num_groups, num_channels)
+        self.gn = nn.GroupNorm(g, num_channels)
+    def forward(self, x): return self.gn(x)
+
+class ResBlockFiLM(nn.Module):
+    def __init__(self, in_ch, out_ch, emb_dim, dropout=0.0):
+        super().__init__()
+        self.norm1 = GroupNorm32(in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+
+        self.norm2 = GroupNorm32(out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+
+        self.emb_proj = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, out_ch * 2))
+        self.skip = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x, emb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        scale, shift = torch.chunk(self.emb_proj(emb), 2, dim=1)
+        h = self.norm2(h)
+        h = h * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+        h = self.conv2(self.dropout(F.silu(h)))
+        return h + self.skip(x)
+
+class Downsample(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.op = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
+    def forward(self, x): return self.op(x)
+
+class Upsample(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.op = nn.Conv2d(ch, ch, 3, padding=1)
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.op(x)
+
+class UNet2D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = None,
+        cond_dim: int = 0,
+        base: int = 64,
+        time_dim: int = 256,
+        ch_mult=(1, 2, 4),
+        num_res_blocks: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.ch_mult = tuple(ch_mult)
+        self.num_res_blocks = int(num_res_blocks)
+        out_channels = out_channels or in_channels
+        self.time_dim = time_dim
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_dim * 4, time_dim),
+        )
+
+        self.cond_proj = None
+        if cond_dim > 0:
+            self.cond_proj = nn.Sequential(
+                nn.Linear(cond_dim, time_dim * 2),
+                nn.SiLU(),
+                nn.Linear(time_dim * 2, time_dim),
+            )
+
+        self.in_conv = nn.Conv2d(in_channels, base, 3, padding=1)
+
+        # Down
+        self.down_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        self.skip_channels = []
+
+        cur = base
+        self.skip_channels.append(cur)
+
+        for level, mult in enumerate(self.ch_mult):
+            out_ch = base * mult
+            for _ in range(self.num_res_blocks):
+                self.down_blocks.append(ResBlockFiLM(cur, out_ch, emb_dim=time_dim, dropout=dropout))
+                cur = out_ch
+                self.skip_channels.append(cur)
+            if level != len(self.ch_mult) - 1:
+                self.downsamples.append(Downsample(cur))
+                self.skip_channels.append(cur)
+
+        # Middle
+        self.mid1 = ResBlockFiLM(cur, cur, emb_dim=time_dim, dropout=dropout)
+        self.mid2 = ResBlockFiLM(cur, cur, emb_dim=time_dim, dropout=dropout)
+
+        # Up
+        self.up_blocks = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
+
+        skip_chs = list(self.skip_channels)
+
+        for level, mult in reversed(list(enumerate(self.ch_mult))):
+            out_ch = base * mult
+            for _ in range(self.num_res_blocks):
+                skip = skip_chs.pop()
+                self.up_blocks.append(ResBlockFiLM(cur + skip, out_ch, emb_dim=time_dim, dropout=dropout))
+                cur = out_ch
+            if level != 0:
+                skip = skip_chs.pop()
+                self.up_blocks.append(ResBlockFiLM(cur + skip, out_ch, emb_dim=time_dim, dropout=dropout))
+                cur = out_ch
+                self.upsamples.append(Upsample(cur))
+
+        self.out_norm = GroupNorm32(cur)
+        self.out_conv = nn.Conv2d(cur, out_channels, 3, padding=1)
+
+    def forward(self, x, t, cond=None):
+        # time emb
+        t_emb = sinusoidal_time_embedding(t, self.time_dim)
+        emb = self.time_mlp(t_emb)
+        if self.cond_proj is not None and cond is not None:
+            emb = emb + self.cond_proj(cond)
+
+        h = self.in_conv(x)
+        hs = [h]
+
+        # Down staged
+        dbi = 0
+        dsi = 0
+        for level, _mult in enumerate(self.ch_mult):
+            for _ in range(self.num_res_blocks):
+                h = self.down_blocks[dbi](h, emb); dbi += 1
+                hs.append(h)
+            if level != len(self.ch_mult) - 1:
+                h = self.downsamples[dsi](h); dsi += 1
+                hs.append(h)
+
+        # Middle
+        h = self.mid1(h, emb)
+        h = self.mid2(h, emb)
+
+        # Up staged
+        ubi = 0
+        usi = 0
+        for level, _mult in reversed(list(enumerate(self.ch_mult))):
+            for _ in range(self.num_res_blocks):
+                skip = hs.pop()
+                h = self.up_blocks[ubi](torch.cat([h, skip], dim=1), emb); ubi += 1
+            if level != 0:
+                skip = hs.pop()
+                h = self.up_blocks[ubi](torch.cat([h, skip], dim=1), emb); ubi += 1
+                h = self.upsamples[usi](h); usi += 1
+
+        return self.out_conv(F.silu(self.out_norm(h)))
+
+
+def kl_divergence_gaussian(mu, logvar):
+    # KL( N(mu, var) || N(0, I) )
+    return 0.5 * torch.mean(torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1))
+
+# -------------------------
+# 2) Simple Conv Encoder/Decoder (CVAE)
+# -------------------------
+class CVAE(nn.Module):
+    """
+    Conditional VAE
+    - Encoder: x + cond -> (mu, logvar)
+    - Decoder: z + cond -> x_hat
+    """
+    def __init__(self, in_channels, cond_dim, latent_dim=128, base=64):
+        super().__init__()
+        self.in_channels = in_channels
+        self.cond_dim = cond_dim
+        self.latent_dim = latent_dim
+        self.base = base
+
+        # ---- Encoder (Conv) ----
+        # x: (B,C,H,W)
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_channels, base, 4, 2, 1),   # H/2
+            nn.SiLU(),
+            nn.Conv2d(base, base*2, 4, 2, 1),        # H/4
+            nn.SiLU(),
+            nn.Conv2d(base*2, base*4, 4, 2, 1),      # H/8
+            nn.SiLU(),
+            nn.Conv2d(base*4, base*4, 3, 1, 1),
+            nn.SiLU(),
+        )
+
+        # cond embedding -> will be fused at bottleneck
+        self.cond_to_enc = nn.Sequential(
+            nn.Linear(cond_dim, base*4),
+            nn.SiLU(),
+            nn.Linear(base*4, base*4),
+        )
+
+        # We'll infer bottleneck spatial size in forward once (lazy)
+        self._enc_out_hw = None
+        self._enc_out_ch = base*4
+
+        self.to_mu = None
+        self.to_logvar = None
+        self.z_to_dec = None
+
+        # ---- Decoder (Deconv) ----
+        self.cond_to_dec = nn.Sequential(
+            nn.Linear(cond_dim, base*4),
+            nn.SiLU(),
+            nn.Linear(base*4, base*4),
+        )
+
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(base*4, base*4, 4, 2, 1),  # x2
+            nn.SiLU(),
+            nn.ConvTranspose2d(base*4, base*2, 4, 2, 1),  # x4
+            nn.SiLU(),
+            nn.ConvTranspose2d(base*2, base, 4, 2, 1),    # x8
+            nn.SiLU(),
+            nn.Conv2d(base, in_channels, 3, 1, 1),
+        )
+
+    def _build_latent_heads_if_needed(self, h):
+        # h: (B, Ch, Hh, Wh)
+        if self._enc_out_hw is None:
+            self._enc_out_hw = (h.shape[-2], h.shape[-1])
+            flat_dim = h.shape[1] * h.shape[2] * h.shape[3]
+
+            self.to_mu = nn.Linear(flat_dim, self.latent_dim).to(h.device)
+            self.to_logvar = nn.Linear(flat_dim, self.latent_dim).to(h.device)
+            self.z_to_dec = nn.Linear(self.latent_dim, flat_dim).to(h.device)
+
+    def encode(self, x, cond):
+        h = self.enc(x)  # (B, base*4, H/8, W/8)
+        self._build_latent_heads_if_needed(h)
+
+        # fuse cond at bottleneck (channel-wise bias)
+        if cond is not None:
+            c = self.cond_to_enc(cond)[:, :, None, None]  # (B, base*4, 1, 1)
+            h = h + c
+
+        h_flat = h.flatten(1)
+        mu = self.to_mu(h_flat)
+        logvar = self.to_logvar(h_flat)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, cond):
+        # (B, latent_dim) -> (B, base*4, H/8, W/8)
+        flat = self.z_to_dec(z)
+        Hh, Wh = self._enc_out_hw
+        h = flat.view(z.shape[0], self._enc_out_ch, Hh, Wh)
+        if cond is not None:
+            # fuse cond at decoder input too
+            c = self.cond_to_dec(cond)[:, :, None, None]
+            h = h + c
+
+        x_hat = self.dec(h)
+        return x_hat
+
+    def forward(self, x, cond=None):
+        mu, logvar = self.encode(x, cond)
+        z = self.reparameterize(mu, logvar)
+        x_hat = self.decode(z, cond)
+        return x_hat, mu, logvar, z

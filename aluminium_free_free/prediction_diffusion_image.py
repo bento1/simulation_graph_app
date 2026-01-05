@@ -78,74 +78,76 @@ class DiffusionScheduler:
         self.alphas = 1.0 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, dim=0)
 
+def main():
+    root = "./test"
+    if torch.cuda.is_available() :
+        device='cuda'
+    elif torch.backends.mps.is_available() :
+        device='mps'
+    else :
+        device='cpu'
+    file_name="diffustion_ver3_early"
+    with open(f"model_param_{file_name}.json", "r", encoding="utf-8") as f:
+        model_param = json.load(f)
 
-root = "./test"
-if torch.cuda.is_available() :
-    device='cuda'
-elif torch.backends.mps.is_available() :
-    device='mps'
-else :
-    device='cpu'
-file_name="diffustion_ver3_early"
-with open(f"model_param_{file_name}.json", "r", encoding="utf-8") as f:
-    model_param = json.load(f)
+    ds = MeshDataset(root_dir=root,scale_info=model_param['dataset_scale_info'],GRID=model_param['GRID'],in_channels=model_param['in_channels'])
+    loader = DataLoader(ds, batch_size=1, shuffle=False)
 
-ds = MeshDataset(root_dir=root,scale_info=model_param['dataset_scale_info'],GRID=model_param['GRID'],in_channels=model_param['in_channels'])
-loader = DataLoader(ds, batch_size=1, shuffle=False)
+    model = ContextUnet(
+        in_channels=model_param['in_channels'],
+        out_channels=model_param['out_channels'],
+        n_feat=model_param['n_feat'],
+        n_cfeat=model_param['n_cfeat'],
+        height=model_param['GRID'],
+        ).to(device)
 
-model = ContextUnet(
-    in_channels=model_param['in_channels'],
-    out_channels=model_param['out_channels'],
-    n_feat=model_param['n_feat'],
-    n_cfeat=model_param['n_cfeat'],
-    height=model_param['GRID'],
-    ).to(device)
-
-checkpoint = torch.load(f"mesh_invariant_{file_name}.pt", map_location=device)
-model.load_state_dict(checkpoint)
-model.eval()
-sched = DiffusionScheduler(device=device)
-sched.T=1000
-K=int((model_param['in_channels']-1)/2)
-for batch in loader:
+    checkpoint = torch.load(f"mesh_invariant_{file_name}.pt", map_location=device)
+    model.load_state_dict(checkpoint)
     model.eval()
+    sched = DiffusionScheduler(device=device)
+    sched.T=1000
+    K=int((model_param['in_channels']-1)/2)
+    for batch in loader:
+        model.eval()
 
-    # batch = {k: v.to(device) for k, v in batch.items()}
-    data=[]
-    for m in batch:
-        pos  = m["slice_z_idx"]
-        cond = m["cond"].to(device)
-        x_hat = sample_image(model, cond, sched,(1,model_param['in_channels'],model_param['GRID'],model_param['GRID']), device)
-        data.append(x_hat.cpu().detach().numpy()[0,K,:,:])
+        # batch = {k: v.to(device) for k, v in batch.items()}
+        data=[]
+        for m in batch:
+            pos  = m["slice_z_idx"]
+            cond = m["cond"].to(device)
+            x_hat = sample_image(model, cond, sched,(1,model_param['in_channels'],model_param['GRID'],model_param['GRID']), device)
+            data.append(x_hat.cpu().detach().numpy()[0,K,:,:])
 
 
-for i in range(data.shape[0]):
-    data[i,:]=inverse_minmax_scale(data[i,:],model_param['dataset_scale_info']['uz']['min'],model_param['dataset_scale_info']['uz']['max'])
-# {
-#   "Lx": 6,
-#   "Ly": 2,
-#   "Lz": 2,
-#   "nx": 16,
-#   "ny": 18,
-#   "nz": 10,
-#   "xm0": 0.9972,
-#   "xm1": 1.7471999999999999,
-#   "ym0": 0.36,
-#   "ym1": 0.5822222222222222,
-#   "zm0": 0,
-#   "zm1": 0.4,
-#   "E": 69000000000.0,
-#   "nu": 0.33,
-#   "rho": 2700,
-#   "m_add": 31,
-#   "freq": 262,
-#   "a_base": 15,
-#   "zeta": 0.005
-# }
-with open(f"params.json", "r", encoding="utf-8") as f:
-    params = json.load(f)
-x_lin = np.linspace(0, params['Lx'], model_param['GRID'])
-y_lin = np.linspace(0, params['Ly'], model_param['GRID'])
-z_lin = np.linspace(0, params['Lz'], model_param['GRID'])
-draw_disp_on_mesh_3d(x_lin,y_lin,z_lin,data)
+    for i in range(data.shape[0]):
+        data[i,:]=inverse_minmax_scale(data[i,:],model_param['dataset_scale_info']['uz']['min'],model_param['dataset_scale_info']['uz']['max'])
+    # {
+    #   "Lx": 6,
+    #   "Ly": 2,
+    #   "Lz": 2,
+    #   "nx": 16,
+    #   "ny": 18,
+    #   "nz": 10,
+    #   "xm0": 0.9972,
+    #   "xm1": 1.7471999999999999,
+    #   "ym0": 0.36,
+    #   "ym1": 0.5822222222222222,
+    #   "zm0": 0,
+    #   "zm1": 0.4,
+    #   "E": 69000000000.0,
+    #   "nu": 0.33,
+    #   "rho": 2700,
+    #   "m_add": 31,
+    #   "freq": 262,
+    #   "a_base": 15,
+    #   "zeta": 0.005
+    # }
+    with open(f"params.json", "r", encoding="utf-8") as f:
+        params = json.load(f)
+    x_lin = np.linspace(0, params['Lx'], model_param['GRID'])
+    y_lin = np.linspace(0, params['Ly'], model_param['GRID'])
+    z_lin = np.linspace(0, params['Lz'], model_param['GRID'])
+    draw_disp_on_mesh_3d(x_lin,y_lin,z_lin,data)
 
+if __name__=='__main__':
+    main()
