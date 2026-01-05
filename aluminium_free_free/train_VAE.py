@@ -43,6 +43,18 @@ class DiffusionScheduler:
         self.alphas = 1.0 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, dim=0)
 
+def q_sample(x0, t, sched, batch):
+    """
+    x0    : [N,Co]
+    t     : [B]      (mesh-wise)
+    batch : [N]
+    """
+    noise = torch.randn_like(x0)
+    ab = sched.alpha_bar[t][batch]
+    ab=ab.view(-1, 1, 1, 1)     
+    x_t = torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * noise
+    return x_t, noise
+
 def draw(data1,data2,model_param): 
     stride=1 
     clip_q=(0.25,0.75) 
@@ -73,7 +85,7 @@ def cvae_loss(x, x_hat, mu, logvar, beta=1e-3):
     KL: standard normal prior
     beta: KL weight (warmup 권장)
     """
-    recon = F.l1_loss(x_hat, x)
+    recon = F.mse_loss(x_hat, x)
     kl = kl_divergence_gaussian(mu, logvar)
 
     return recon + beta * kl, {"recon": recon.detach(), "kl": kl.detach()}
@@ -90,7 +102,7 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            x_hat, mu, logvar, _ = model(batch['image'], batch['cond']) 
+            x_hat, mu, logvar, _ = model(batch['image'], None) 
             loss, parts = cvae_loss(batch['image'], x_hat, mu, logvar, beta=beta) 
             opt.zero_grad() 
             loss.backward() 
@@ -98,7 +110,7 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch):
             total += float(loss.item())
             count+=1 
             if count % 1000 == 0: 
-                print(i,'batch',count,'step','loss : ',float(loss.item()),'kl loss : ', parts['kl']) 
+                print('epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'kl loss: ', parts['kl']) 
                 origin_image=torch.stack(imags[b]).to(device)[0,:][(model_param['in_channels']-1)//2] 
                 pred_image=x_hat[0,:][(model_param['in_channels']-1)//2] 
                 draw(origin_image,pred_image,model_param) 
@@ -119,12 +131,12 @@ def eval_one_epoch(model, loader, device,  model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            x_hat, mu, logvar, _ = model(batch['image'], batch['cond']) 
+            x_hat, mu, logvar, _ = model(batch['image'], None) 
             loss, parts = cvae_loss(batch['image'], x_hat, mu, logvar, beta=beta) 
             total += float(loss.item())
             count+=1 
             if count % 100 == 0: 
-                print(i,'batch',count,'step','loss : ',float(loss.item()),'kl loss : ', parts['kl']) 
+                print('epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'kl loss: ', parts['kl']) 
                 origin_image=torch.stack(imags[b]).to(device)[0,:][(model_param['in_channels']-1)//2] 
                 pred_image=x_hat[0,:][(model_param['in_channels']-1)//2] 
                 draw(origin_image,pred_image,model_param) 
@@ -148,14 +160,14 @@ def main():
                 'learning_rate':1e-4,
                 'num_epochs':1000,
                 'base':256,
-                'latent_dim':256,
-                'T':1000, } 
+                'latent_dim':512,
+                'batch_size':16, } 
     
-    train_ds = MeshDataset(root_dir=root,type='train',GRID=model_param['GRID'],in_channels=5) 
-    val_ds= MeshDataset(root_dir=root,type='valid',GRID=model_param['GRID'],in_channels=5) 
+    train_ds = MeshDataset(root_dir=root,type='train',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
+    val_ds= MeshDataset(root_dir=root,type='valid',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
 
-    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate_flatten) 
-    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, collate_fn=collate_flatten) 
+    train_loader = DataLoader(train_ds, batch_size=model_param['batch_size'], shuffle=True, collate_fn=collate_flatten) 
+    val_loader = DataLoader(val_ds, batch_size=model_param['batch_size'], shuffle=False, collate_fn=collate_flatten) 
     example = train_ds[0] 
     model_param['cond_dim']=len(example['cond'][0]) 
     model_param['dataset_scale_info']=train_ds.scale_info 
