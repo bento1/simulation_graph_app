@@ -8,50 +8,64 @@ def makeFolder(folder_path):
         os.makedirs(folder_path)
         return True
     return False
+def minmax_scale(x, xmin, xmax, s=(0,1)):
+    """
+    x    : input tensor / scalar
+    xmin : min value
+    xmax : max value
+    a,b  : target range [a,b]
+    """
+    a,b=s
+    if xmax == xmin:
+        # 정보가 없을 때 중앙값으로 보냄
+        return (a + b) / 2
 
-def minmax_scale(params,__min,__max):
-    if __max==0:
-        return 0
-    if __max - __min ==0:
-        return params/__max/2
-    scaled = (params - __min) / (__max - __min)
-    return scaled
+    scaled_01 = (x - xmin) / (xmax - xmin)
+    scaled_ab = scaled_01 * (b - a) + a
+    return scaled_ab
 
-def inverse_minmax_scale(scaled,__min,__max):
-    if __max==0:
-        return 0
-    if __max - __min ==0:
-        return params*__max*2
-    params = scaled* (__max - __min) +__min
-    return params
+def inverse_minmax_scale(x_scaled, xmin, xmax, s=(0,1)):
+    """
+    x_scaled : scaled value in [a,b]
+    xmin,xmax: original range
+    a,b      : scaling range
+    """
+    a,b=s
+    if xmax == xmin:
+        return xmin
+
+    scaled_01 = (x_scaled - a) / (b - a)
+    x = scaled_01 * (xmax - xmin) + xmin
+    return x
 
 
-def feature_normalize(params,scale_info):
+
+def feature_normalize(params,scale_info,s=(0,1)):
 
     Lx=scale_info['Lx']['max']
     Ly=scale_info['Ly']['max']
     Lz=scale_info['Lz']['max']
 
 
-    params['Lx']=minmax_scale(params['Lx'],scale_info['Lx']['min'],scale_info['Lx']['max'])
-    params['Ly']=minmax_scale(params['Ly'],scale_info['Ly']['min'],scale_info['Ly']['max'])
-    params['Lz']= minmax_scale(params['Lz'],scale_info['Lz']['min'],scale_info['Lz']['max'])
-    params['nx']=minmax_scale(params['nx'],scale_info['nx']['min'],scale_info['nx']['max'])
-    params['ny']=minmax_scale(params['ny'],scale_info['ny']['min'],scale_info['ny']['max'])
-    params['nz']=minmax_scale(params['nz'],scale_info['nz']['min'],scale_info['nz']['max'])
-    params['xm0']=minmax_scale(params['xm0'],scale_info['xm0']['min'],scale_info['xm0']['max'])
-    params['xm1']=minmax_scale(params['xm1'],scale_info['xm1']['min'],scale_info['xm1']['max'])
-    params['ym0']=minmax_scale(params['ym0'],scale_info['ym0']['min'],scale_info['ym0']['max'])
-    params['ym1']=minmax_scale(params['ym1'],scale_info['ym1']['min'],scale_info['ym1']['max'])
-    params['zm0']=minmax_scale(params['zm0'],scale_info['zm0']['min'],scale_info['zm0']['max'])
-    params['zm1']=minmax_scale(params['zm1'],scale_info['zm1']['min'],scale_info['zm1']['max'])
-    params['E']=minmax_scale(params['E'],scale_info['E']['min'],scale_info['E']['max'])
-    params['nu']=minmax_scale(params['nu'],scale_info['nu']['min'],scale_info['nu']['max'])
-    params['rho']=minmax_scale(params['rho'],scale_info['rho']['min'],scale_info['rho']['max'])
-    params['m_add']=minmax_scale(params['m_add'],scale_info['m_add']['min'],scale_info['m_add']['max'])
-    params['freq']=minmax_scale(params['freq'],scale_info['freq']['min'],scale_info['freq']['max'])
-    params['a_base']=minmax_scale(params['a_base'],scale_info['a_base']['min'],scale_info['a_base']['max']) 
-    params['zeta']=minmax_scale(params['zeta'],scale_info['zeta']['min'],scale_info['zeta']['max'])
+    params['Lx']=minmax_scale(params['Lx'],scale_info['Lx']['min'],scale_info['Lx']['max'],s)
+    params['Ly']=minmax_scale(params['Ly'],scale_info['Ly']['min'],scale_info['Ly']['max'],s)
+    params['Lz']= minmax_scale(params['Lz'],scale_info['Lz']['min'],scale_info['Lz']['max'],s)
+    params['nx']=minmax_scale(params['nx'],scale_info['nx']['min'],scale_info['nx']['max'],s)
+    params['ny']=minmax_scale(params['ny'],scale_info['ny']['min'],scale_info['ny']['max'],s)
+    params['nz']=minmax_scale(params['nz'],scale_info['nz']['min'],scale_info['nz']['max'],s)
+    params['xm0']=minmax_scale(params['xm0'],scale_info['xm0']['min'],scale_info['xm0']['max'],s)
+    params['xm1']=minmax_scale(params['xm1'],scale_info['xm1']['min'],scale_info['xm1']['max'],s)
+    params['ym0']=minmax_scale(params['ym0'],scale_info['ym0']['min'],scale_info['ym0']['max'],s)
+    params['ym1']=minmax_scale(params['ym1'],scale_info['ym1']['min'],scale_info['ym1']['max'],s)
+    params['zm0']=minmax_scale(params['zm0'],scale_info['zm0']['min'],scale_info['zm0']['max'],s)
+    params['zm1']=minmax_scale(params['zm1'],scale_info['zm1']['min'],scale_info['zm1']['max'],s)
+    params['E']=minmax_scale(params['E'],scale_info['E']['min'],scale_info['E']['max'],s)
+    params['nu']=minmax_scale(params['nu'],scale_info['nu']['min'],scale_info['nu']['max'],s)
+    params['rho']=minmax_scale(params['rho'],scale_info['rho']['min'],scale_info['rho']['max'],s)
+    params['m_add']=minmax_scale(params['m_add'],scale_info['m_add']['min'],scale_info['m_add']['max'],s)
+    params['freq']=minmax_scale(params['freq'],scale_info['freq']['min'],scale_info['freq']['max'],s)
+    params['a_base']=minmax_scale(params['a_base'],scale_info['a_base']['min'],scale_info['a_base']['max'],s) 
+    params['zeta']=minmax_scale(params['zeta'],scale_info['zeta']['min'],scale_info['zeta']['max'],s)
 
 
     return params,Lx, Ly, Lz

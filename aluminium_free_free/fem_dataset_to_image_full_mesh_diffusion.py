@@ -234,13 +234,13 @@ class FemImageDataset(Dataset):
     
     def _load_image(self, sd):
         
-        disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
-        # disp_df=copy(origin_disp_df)
+        origin_disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
+        disp_df=copy(origin_disp_df)
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             origin_params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(copy(origin_params),self.scale_info)
         for key in ["ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max'],(-1,1)))
         vols=[] 
         params_lists=[] 
         for z_idx in range(self.GRID): 
@@ -254,7 +254,7 @@ class FemImageDataset(Dataset):
             params_list=[z_idx/self.GRID]+params_list 
             params_lists.append(params_list) 
 
-        data={ "image":vols, "cond":params_lists} # "slice_z_idx": torch.tensor([z_idx]), }
+        data={ "image":vols, "cond":params_lists, 'min_max':(origin_disp_df['uz'].min(),origin_disp_df['uz'].max(),self.scale_info[key]['min'],self.scale_info[key]['max'])} # "slice_z_idx": torch.tensor([z_idx]), }
 
 
         return data
@@ -292,7 +292,8 @@ class FemImageInferenceDataset(Dataset):
             origin_params = json.load(f)
         params,Lx, Ly, Lz = feature_normalize(copy(origin_params),self.scale_info)
         for key in ["ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+            # disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max'],(-1,1)))
         z_idx = np.random.randint(0, self.GRID)
         # K=int((self.in_channels-1)/2)
         # image=csvToImage_25d_stack(disp_df, z_idx, K=K,GRID=self.GRID,scale=origin_params)

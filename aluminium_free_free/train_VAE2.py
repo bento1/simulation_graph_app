@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
 from fem_dataset_to_image_full_mesh_diffusion import FemImageDataset as MeshDataset
-from fem_model import CVAE
+from fem_model import ResidualVAE
 import json
 from torch.utils.data import DataLoader
 from utils import EarlyStopping
 import gc
 import numpy as np
 import matplotlib.pyplot as plt
-from prediction_diffusion_image import sample_image
+
 
 early_stopping = EarlyStopping(
     patience=50,     # FEM/GNN은 15~30 권장
@@ -20,9 +20,10 @@ def collate_flatten(batch):
     batch_size=len(batch) 
     step_num_in_batch=len(batch[0]["image"]) 
     idxs=[] 
-    for _ in range(batch_size): 
+    for i in range(batch_size): 
         idx = torch.randperm(len(batch[0]["image"])) 
         idxs.append(idx) 
+        print(batch[i]['min_max'])
     idxs=np.array(idxs).T 
 
     for i in range(step_num_in_batch): 
@@ -44,6 +45,7 @@ def draw(data1,data2,model_param):
     Uf1_clip = np.clip(data1.cpu().detach().numpy(), ql, qh) 
     ql, qh = np.quantile(data2.cpu().detach().numpy(), clip_q) 
     Uf2_clip = np.clip(data2.cpu().detach().numpy(), ql, qh) 
+    print('vmin',Uf1_clip.min(),'vmax',Uf1_clip.max())
     plt.figure(figsize=(8, 4)) 
     plt.subplot(1, 2, 1) 
     plt.imshow(Uf1_clip, cmap="gray",vmin=Uf1_clip.min(),vmax=Uf1_clip.max()) 
@@ -73,8 +75,9 @@ def cvae_loss(x, x_hat, mu, logvar, beta=1e-3):
     
     detail_recon = F.mse_loss(x_hat-x_hat_mean, x-x_mean)
     kl = kl_divergence_gaussian(mu, logvar)
-
-    return mean_recon+100*detail_recon + beta * kl, {"mean_recon": mean_recon.detach(), "detail_recon": detail_recon.detach(),  "kl": kl.detach()}
+    recon= mean_recon+ detail_recon
+    scale=mean_recon.item()/recon.item()
+    return mean_recon+ scale* detail_recon + beta * kl, {"mean_recon": mean_recon.detach(), "detail_recon": detail_recon.detach(),  "kl": kl.detach()}
 def train_one_epoch(model, loader, device, opt, model_param,epoch): 
     model.train() 
     total = 0.0 
@@ -88,18 +91,18 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            x_hat, mu, logvar, _ = model(s_batch['image']) 
+            x_hat, mu, logvar, _, ms = model(s_batch['image']) 
             loss, parts = cvae_loss(s_batch['image'], x_hat, mu, logvar, beta=beta) 
             opt.zero_grad() 
             loss.backward() 
             opt.step() 
             total += float(loss.item())
             count+=1 
-            # if count % 100 == 0: 
-            print('[TRAIN] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'detail_loss : ',parts['detail_recon'] ,'kl loss: ', parts['kl']) 
-            origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
-            pred_image=x_hat[0,:][(model_param['in_channels']-1)//2].cpu()
-            draw(origin_image,pred_image,model_param) 
+            if count % 100 == 0: 
+                print('[TRAIN] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'detail_loss : ',parts['detail_recon'] ,'kl loss: ', parts['kl']) 
+                origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
+                pred_image=x_hat[0,:][(model_param['in_channels']-1)//2].cpu()
+                draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
     return total / max(1, count)
@@ -117,14 +120,14 @@ def eval_one_epoch(model, loader, device,  model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            x_hat, mu, logvar, _ = model(s_batch['image']) 
+            x_hat, mu, logvar, _ , ms= model(s_batch['image']) 
             loss, parts = cvae_loss(s_batch['image'], x_hat, mu, logvar, beta=beta) 
             total += float(loss.item())
             count+=1 
             if count % 100 == 0: 
                 print('[VALID] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'detail_loss : ',parts['detail_recon'] ,'kl loss: ', parts['kl']) 
-                origin_image=torch.stack(imags[b]).to('cpu')[0,:][(model_param['in_channels']-1)//2] 
-                pred_image=x_hat[0,:][(model_param['in_channels']-1)//2] 
+                origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
+                pred_image=x_hat[0,:][(model_param['in_channels']-1)//2].cpu()
                 draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
@@ -143,7 +146,7 @@ def main():
                 'out_channels':3,
                 'GRID':64,
                 'loss_scale':1.0,
-                'learning_rate':1e-4,
+                'learning_rate':1e-3,
                 'num_epochs':1000,
                 'base':256,
                 'latent_dim':1024,
@@ -159,7 +162,7 @@ def main():
     model_param['cond_dim']=len(example['cond'][0]) 
     model_param['dataset_scale_info']=train_ds.scale_info 
 
-    model = CVAE( in_channels=model_param['in_channels'], 
+    model = ResidualVAE( in_channels=model_param['in_channels'], 
                 latent_dim=model_param['latent_dim'], 
                 base=model_param['base'],
                 depth=model_param['depth'] ).to(device)

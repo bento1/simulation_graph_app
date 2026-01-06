@@ -1203,111 +1203,132 @@ def kl_divergence_gaussian(mu, logvar):
     # KL( N(mu, var) || N(0, I) )
     return 0.5 * torch.mean(torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1))
 
-# -------------------------
-# 2) Simple Conv Encoder/Decoder (CVAE)
-# -------------------------
-class CVAE(nn.Module):
-    """
-    Conditional VAE
-    - Encoder: x + cond -> (mu, logvar)
-    - Decoder: z + cond -> x_hat
-    """
-    def __init__(self, in_channels, cond_dim, latent_dim=128, base=64):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.in_channels = in_channels
-        self.cond_dim = cond_dim
-        self.latent_dim = latent_dim
-        self.base = base
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
 
-        # ---- Encoder (Conv) ----
-        # x: (B,C,H,W)
-        self.enc = nn.Sequential(
-            nn.Conv2d(in_channels, base, 4, 2, 1),   # H/2
-            nn.SiLU(),
-            nn.Conv2d(base, base*2, 4, 2, 1),        # H/4
-            nn.SiLU(),
-            nn.Conv2d(base*2, base*4, 4, 2, 1),      # H/8
-            nn.SiLU(),
-            nn.Conv2d(base*4, base*4, 3, 1, 1),
-            nn.SiLU(),
+        self.norm1 = nn.BatchNorm2d(out_ch)
+        self.norm2 = nn.BatchNorm2d(out_ch)
+
+        self.act = nn.SiLU()
+
+        self.skip = (
+            nn.Conv2d(in_ch, out_ch, 1)
+            if in_ch != out_ch else nn.Identity()
         )
 
-        # cond embedding -> will be fused at bottleneck
-        self.cond_to_enc = nn.Sequential(
-            nn.Linear(cond_dim, base*4),
-            nn.SiLU(),
-            nn.Linear(base*4, base*4),
-        )
+    def forward(self, x):
+        h = self.act(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
+        return self.act(h + self.skip(x))
 
-        # We'll infer bottleneck spatial size in forward once (lazy)
-        self._enc_out_hw = None
-        self._enc_out_ch = base*4
+class Encoder(nn.Module):
+    def __init__(self, in_channels, latent_dim, base, depth):
+        super().__init__()
 
-        self.to_mu = None
-        self.to_logvar = None
-        self.z_to_dec = None
+        layers = []
+        ch = in_channels
 
-        # ---- Decoder (Deconv) ----
-        self.cond_to_dec = nn.Sequential(
-            nn.Linear(cond_dim, base*4),
-            nn.SiLU(),
-            nn.Linear(base*4, base*4),
-        )
+        for i in range(depth):
+            out_ch = base * (2 ** i)
+            layers.append(ResBlock(ch, out_ch))
+            layers.append(nn.AvgPool2d(2))
+            ch = out_ch
 
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(base*4, base*4, 4, 2, 1),  # x2
-            nn.SiLU(),
-            nn.ConvTranspose2d(base*4, base*2, 4, 2, 1),  # x4
-            nn.SiLU(),
-            nn.ConvTranspose2d(base*2, base, 4, 2, 1),    # x8
-            nn.SiLU(),
-            nn.Conv2d(base, in_channels, 3, 1, 1),
-        )
+        self.conv = nn.Sequential(*layers)
 
-    def _build_latent_heads_if_needed(self, h):
-        # h: (B, Ch, Hh, Wh)
-        if self._enc_out_hw is None:
-            self._enc_out_hw = (h.shape[-2], h.shape[-1])
-            flat_dim = h.shape[1] * h.shape[2] * h.shape[3]
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc_mu = nn.Linear(ch, latent_dim)
+        self.fc_logvar = nn.Linear(ch, latent_dim)
 
-            self.to_mu = nn.Linear(flat_dim, self.latent_dim).to(h.device)
-            self.to_logvar = nn.Linear(flat_dim, self.latent_dim).to(h.device)
-            self.z_to_dec = nn.Linear(self.latent_dim, flat_dim).to(h.device)
+    def forward(self, x):
+        h = self.conv(x)
+        h = self.pool(h).flatten(1)
+        return self.fc_mu(h), self.fc_logvar(h)
 
-    def encode(self, x, cond):
-        h = self.enc(x)  # (B, base*4, H/8, W/8)
-        self._build_latent_heads_if_needed(h)
+def reparameterize(mu, logvar):
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
 
-        # fuse cond at bottleneck (channel-wise bias)
-        if cond is not None:
-            c = self.cond_to_enc(cond)[:, :, None, None]  # (B, base*4, 1, 1)
-            h = h + c
+class Decoder(nn.Module):
+    def __init__(self, out_channels, latent_dim, base, depth):
+        super().__init__()
 
-        h_flat = h.flatten(1)
-        mu = self.to_mu(h_flat)
-        logvar = self.to_logvar(h_flat)
-        return mu, logvar
+        start_ch = base * (2 ** (depth - 1))
+        self.fc = nn.Linear(latent_dim, start_ch * 4 * 4)
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        layers = []
+        ch = start_ch
 
-    def decode(self, z, cond):
-        # (B, latent_dim) -> (B, base*4, H/8, W/8)
-        flat = self.z_to_dec(z)
-        Hh, Wh = self._enc_out_hw
-        h = flat.view(z.shape[0], self._enc_out_ch, Hh, Wh)
-        if cond is not None:
-            # fuse cond at decoder input too
-            c = self.cond_to_dec(cond)[:, :, None, None]
-            h = h + c
+        for i in reversed(range(depth)):
+            out_ch = base * (2 ** i)
 
-        x_hat = self.dec(h)
-        return x_hat
+            layers.append(ResBlock(ch, out_ch))
+            layers.append(
+                nn.ConvTranspose2d(
+                    out_ch,
+                    out_ch,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1
+                )
+            )
+            ch = out_ch
 
-    def forward(self, x, cond=None):
-        mu, logvar = self.encode(x, cond)
-        z = self.reparameterize(mu, logvar)
-        x_hat = self.decode(z, cond)
-        return x_hat, mu, logvar, z
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1))
+        layers.append(nn.Tanh())
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, z):
+        h = self.fc(z).view(z.size(0), -1, 4, 4)
+        return self.conv(h)
+
+
+class CVAE(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        latent_dim=128,
+        base=64,
+        depth=4
+    ):
+        super().__init__()
+
+        self.encoder = Encoder(in_channels, latent_dim, base, depth)
+        self.decoder = Decoder(in_channels, latent_dim, base, depth)
+
+    def forward(self, x, ):
+        mu, logvar = self.encoder(x)
+        z = reparameterize(mu, logvar)
+        recon = self.decoder(z)
+        return recon, mu, logvar, z
+
+class ResidualVAE(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        latent_dim=128,
+        base=64,
+        depth=4
+    ):
+        super().__init__()
+
+        self.encoder = Encoder(in_channels, latent_dim, base, depth)
+        self.decoder = Decoder(in_channels, latent_dim, base, depth)
+
+    def forward(self, x, ):
+        mu_s = x.mean(dim=(2, 3), keepdim=True)
+        dx = x - mu_s
+        mu, logvar = self.encoder(dx)
+        z = reparameterize(mu, logvar)
+        recon = self.decoder(z)
+        recon = recon + mu_s
+        return recon, mu, logvar, z, mu_s
