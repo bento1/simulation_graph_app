@@ -1332,3 +1332,88 @@ class ResidualVAE(nn.Module):
         recon = self.decoder(z)
         recon = recon + mu_s
         return recon, mu, logvar, z, mu_s
+    
+class EncoderConvZ(nn.Module): 
+    def __init__(self, in_channels, latent_dim, base, depth): 
+        super().__init__() 
+        layers = [] 
+        ch = in_channels 
+        for i in range(depth): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(nn.AvgPool2d(2)) 
+            ch = out_ch 
+        
+        self.conv = nn.Sequential(*layers) 
+        self.conv_mu = nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
+        self.conv_logvar =nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
+    
+    def forward(self, x):
+        h = self.conv(x) 
+        logvar = torch.clamp(self.conv_logvar(h), min=-10, max=10)
+        return self.conv_mu(h), logvar 
+
+def reparameterize(mu, logvar): 
+    std = torch.exp(0.5 * logvar) 
+    eps = torch.randn_like(std) 
+    return mu + eps * std
+class ScalingDecoderConvZ(nn.Module):
+    def __init__(self, out_channels, latent_dim, base, depth): 
+        super().__init__() 
+        self.latent_dim=latent_dim 
+        ch = latent_dim 
+        layers = [] 
+        for i in reversed(range(depth)): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+            layers.append(nn.SiLU()) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1))
+        self.conv = nn.Sequential(*layers) 
+
+    def forward(self, latent): 
+        z_q = latent[:, :self.latent_dim] # [B, Z] 
+        mean = latent[:, self.latent_dim:self.latent_dim+1] # [B,1] 
+        std = latent[:, self.latent_dim+1:self.latent_dim+2] # [B,1] 
+        scaled_image=self.conv(z_q) 
+        B,C,X,Y=scaled_image.shape 
+        mean=mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        std=std[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        iamge=scaled_image*std.expand(B,C,X,Y)+mean.expand(B,C,X,Y) 
+        return scaled_image,iamge
+class ScalingVAE3(nn.Module): 
+    def __init__( self, in_channels, latent_dim=128, base=64, depth=4 ): 
+        super().__init__() 
+        self.encoder = EncoderConvZ(in_channels, latent_dim, base, depth) 
+        self.decoder = ScalingDecoderConvZ(in_channels, latent_dim, base, depth) 
+    
+    def forward(self, x): 
+        mean = x.mean(dim=(1,2,3), keepdim=True).detach() 
+        std = x.std(dim=(1,2,3), keepdim=True).detach() + 1e-8 
+        x_norm=(x-mean)/std 
+        mu, logvar = self.encoder(x_norm) 
+        z = reparameterize(mu, logvar) 
+        B,C,X,Y=z.shape 
+        z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
+        scaled_image,iamge = self.decoder(z) 
+        return scaled_image,iamge, mu, logvar, z
+    
+if  __name__=='__main__':
+    x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
+    model_param={ 'in_channels':3, 
+            'out_channels':3,
+            'GRID':64,
+            'loss_scale':1.0,
+            'learning_rate':1e-3,
+            'num_epochs':1000,
+            'base':256,
+            'latent_dim':16,
+            'batch_size':2,
+            'depth':4 } 
+    model = ScalingVAE3( in_channels=model_param['in_channels'], 
+            latent_dim=model_param['latent_dim'], 
+            base=model_param['base'],
+            depth=model_param['depth'] )
+    model(x)
