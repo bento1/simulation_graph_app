@@ -1383,6 +1383,7 @@ class ScalingDecoderConvZ(nn.Module):
         std=std[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
         iamge=scaled_image*std.expand(B,C,X,Y)+mean.expand(B,C,X,Y) 
         return scaled_image,iamge
+    
 class ScalingVAE3(nn.Module): 
     def __init__( self, in_channels, latent_dim=128, base=64, depth=4 ): 
         super().__init__() 
