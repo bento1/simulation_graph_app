@@ -1400,9 +1400,312 @@ class ScalingVAE3(nn.Module):
         z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
         scaled_image,iamge = self.decoder(z) 
         return scaled_image,iamge, mu, logvar, z
+
+def sinusoidal_timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000):
+    """
+    t: (B,) int64 or float32
+    return: (B, dim)
+    """
+    if t.dtype != torch.float32 and t.dtype != torch.float64:
+        t = t.float()
+
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(0, half, device=t.device).float() / half
+    )
+    args = t[:, None] * freqs[None, :]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb  # (B, dim)
+
+class DDPMScheduler:
+    def __init__(self, T=1000, beta_start=1e-4, beta_end=2e-2):
+        self.T = T
+        betas = torch.linspace(beta_start, beta_end, T)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]], dim=0)
+
+        self.betas = betas
+        self.alphas = alphas
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas_cumprod_prev = alphas_cumprod_prev
+
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+
+        # posterior q(x_{t-1} | x_t, x0) variance
+        self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.posterior_log_variance_clipped = torch.log(torch.clamp(self.posterior_variance, min=1e-20))
+
+        # posterior mean coefficients
+        self.posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+
+    def to(self, device):
+        for k, v in self.__dict__.items():
+            if torch.is_tensor(v):
+                setattr(self, k, v.to(device))
+        return self
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor):
+        a = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+        b = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+        return a * x0 + b * noise
+
+    @torch.no_grad()
+    def predict_x0_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
+        """
+        x0 = (x_t - sqrt(1-a_bar)*eps) / sqrt(a_bar)
+        """
+        a = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+        b = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+        return (x_t - b * eps) / torch.clamp(a, min=1e-8)
+
+    @torch.no_grad()
+    def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, eps_hat: torch.Tensor):
+        """
+        DDPM: use eps_hat to estimate x0 then compute posterior mean/var for x_{t-1}.
+        """
+        x0_hat = self.predict_x0_from_eps(x_t, t, eps_hat)
+
+        coef1 = self.posterior_mean_coef1[t].view(-1, 1, 1, 1)
+        coef2 = self.posterior_mean_coef2[t].view(-1, 1, 1, 1)
+        mean = coef1 * x0_hat + coef2 * x_t
+
+        log_var = self.posterior_log_variance_clipped[t].view(-1, 1, 1, 1)
+        return mean, log_var, x0_hat
+
+    @torch.no_grad()
+    def p_sample(self, model, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor):
+        """
+        Sample x_{t-1} from p(x_{t-1} | x_t)
+        """
+        eps_hat = model(x_t, t, cond)
+        mean, log_var, _ = self.p_mean_variance(x_t, t, eps_hat)
+
+        # t==0이면 noise를 더하지 않음
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+        x_prev = mean + nonzero_mask * torch.exp(0.5 * log_var) * noise
+        return x_prev
+
+    @torch.no_grad()
+    def p_sample_loop(self, model, shape, cond: torch.Tensor, device=None, return_all=False):
+        """
+        Start from x_T ~ N(0, I), iterate t=T-1..0.
+        """
+        device = device or cond.device
+        x = torch.randn(shape, device=device)
+        xs = [x] if return_all else None
+
+        for ti in reversed(range(self.T)):
+            t = torch.full((shape[0],), ti, device=device, dtype=torch.long)
+            x = self.p_sample(model, x, t, cond)
+            if return_all:
+                xs.append(x)
+
+        return xs if return_all else x
+class CondTokens(nn.Module):
+    """
+    cond: (B, Z)  -> tokens: (B, N, d)
+    """
+    def __init__(self, cond_dim: int, num_tokens: int, token_dim: int):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        self.proj = nn.Sequential(
+            nn.Linear(cond_dim, num_tokens * token_dim),
+            nn.SiLU(),
+            nn.Linear(num_tokens * token_dim, num_tokens * token_dim),
+        )
+
+    def forward(self, cond: torch.Tensor):
+        B = cond.size(0)
+        tok = self.proj(cond).view(B, self.num_tokens, self.token_dim)
+        return tok
+
+class FiLM(nn.Module):
+    """
+    Produces (gamma, beta) from (cond + time).
+    """
+    def __init__(self, in_dim: int, feat_channels: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(in_dim, feat_channels * 2),
+        )
+
+    def forward(self, h: torch.Tensor, ctx: torch.Tensor):
+        """
+        h:   (B,C,H,W)
+        ctx: (B, in_dim)
+        """
+        gamma, beta = self.mlp(ctx).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta  = beta[:, :, None, None]
+        return gamma * h + beta
+class FiLMResBlock(nn.Module):
+    def __init__(self, channels: int, ctx_dim: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.film1 = FiLM(ctx_dim, channels)
+        self.film2 = FiLM(ctx_dim, channels)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor):
+        h = self.conv1(F.silu(self.film1(self.norm1(x), ctx)))
+        h = self.conv2(F.silu(self.film2(self.norm2(h), ctx)))
+        return x + h
     
+class CrossAttention(nn.Module):
+    def __init__(self, q_dim: int, kv_dim: int, num_heads: int = 4, head_dim: int = 32):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        inner = num_heads * head_dim
+
+        self.to_q = nn.Linear(q_dim, inner, bias=False)
+        self.to_k = nn.Linear(kv_dim, inner, bias=False)
+        self.to_v = nn.Linear(kv_dim, inner, bias=False)
+        self.to_out = nn.Linear(inner, q_dim)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor):
+        """
+        q:  (B, Nq, q_dim)  e.g. Nq=16
+        kv: (B, Nk, kv_dim) condition tokens
+        """
+        B, Nq, _ = q.shape
+        Nk = kv.size(1)
+
+        qh = self.to_q(q).view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,Nq,D)
+        kh = self.to_k(kv).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2) # (B,H,Nk,D)
+        vh = self.to_v(kv).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2) # (B,H,Nk,D)
+
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn = torch.softmax(torch.matmul(qh, kh.transpose(-2, -1)) * scale, dim=-1)   # (B,H,Nq,Nk)
+        out = torch.matmul(attn, vh)  # (B,H,Nq,D)
+        out = out.transpose(1, 2).contiguous().view(B, Nq, self.num_heads * self.head_dim)
+        return self.to_out(out)  # (B,Nq,q_dim)
+class CrossAttnResBlock(nn.Module):
+    """
+    ResBlock + Cross-Attn (cond tokens) in the middle.
+    We still use FiLM lightly for stability (optional but 추천).
+    """
+    def __init__(self, channels: int, ctx_dim: int, token_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+
+        self.attn = CrossAttention(q_dim=channels, kv_dim=token_dim, num_heads=num_heads, head_dim=max(16, channels // (num_heads*2)))
+        self.norm_attn = nn.LayerNorm(channels)
+
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+        self.film = FiLM(ctx_dim, channels)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor, cond_tokens: torch.Tensor):
+        # conv
+        h = self.conv1(F.silu(self.film(self.norm1(x), ctx)))
+
+        # cross-attn over 4x4 tokens
+        B, C, H, W = h.shape  # H=W=4
+        q = h.flatten(2).transpose(1, 2)          # (B,16,C)
+        q = self.norm_attn(q)
+        q = q + self.attn(q, cond_tokens)         # (B,16,C)
+        h = q.transpose(1, 2).view(B, C, H, W)    # back to (B,C,4,4)
+
+        # conv
+        h = self.conv2(F.silu(self.film(self.norm2(h), ctx)))
+        return x + h
+    
+class TinyLatentDiffusion(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        base_channels: int,
+        cond_dim: int,          # Z
+        num_cond_tokens: int,   # N
+        token_dim: int,         # d
+        time_dim: int = 128,
+    ):
+        super().__init__()
+
+        self.time_dim = time_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_dim * 4, time_dim),
+        )
+
+        # ctx = concat([cond, time_emb]) -> ctx_dim
+        self.ctx_dim = cond_dim + time_dim
+
+        self.cond_tokens = CondTokens(cond_dim, num_cond_tokens, token_dim)
+
+        self.in_proj = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+
+        self.rb1 = FiLMResBlock(base_channels, self.ctx_dim)
+        self.rb2 = FiLMResBlock(base_channels, self.ctx_dim)
+
+        self.rb_mid = CrossAttnResBlock(base_channels, self.ctx_dim, token_dim, num_heads=4)
+
+        self.rb3 = FiLMResBlock(base_channels, self.ctx_dim)
+        self.rb4 = FiLMResBlock(base_channels, self.ctx_dim)
+
+        self.out_norm = nn.GroupNorm(8, base_channels)
+        self.out_proj = nn.Conv2d(base_channels, in_channels, 3, padding=1)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor):
+        """
+        x_t: (B,C,4,4)
+        t:   (B,) int64
+        cond:(B,Z)
+        return eps_hat: (B,C,4,4)
+        """
+        # time embedding
+        te = sinusoidal_timestep_embedding(t, self.time_dim)
+        te = self.time_mlp(te)
+
+        # ctx for FiLM blocks
+        ctx = torch.cat([cond, te], dim=1)  # (B, Z+time_dim)
+
+        # cond tokens for cross-attn
+        cond_tok = self.cond_tokens(cond)   # (B, N, d)
+
+        h = self.in_proj(x_t)
+        h = self.rb1(h, ctx)
+        h = self.rb2(h, ctx)
+        h = self.rb_mid(h, ctx, cond_tok)
+        h = self.rb3(h, ctx)
+        h = self.rb4(h, ctx)
+
+        h = F.silu(self.out_norm(h))
+        eps_hat = self.out_proj(h)
+        return eps_hat
+
+
 if  __name__=='__main__':
-    x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
+    # x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
+    # model_param={ 'in_channels':3, 
+    #         'out_channels':3,
+    #         'GRID':64,
+    #         'loss_scale':1.0,
+    #         'learning_rate':1e-3,
+    #         'num_epochs':1000,
+    #         'base':256,
+    #         'latent_dim':16,
+    #         'batch_size':2,
+    #         'depth':4 } 
+    # model = ScalingVAE3( in_channels=model_param['in_channels'], 
+    #         latent_dim=model_param['latent_dim'], 
+    #         base=model_param['base'],
+    #         depth=model_param['depth'] )
+    # model(x)
     model_param={ 'in_channels':3, 
             'out_channels':3,
             'GRID':64,
@@ -1410,11 +1713,24 @@ if  __name__=='__main__':
             'learning_rate':1e-3,
             'num_epochs':1000,
             'base':256,
-            'latent_dim':16,
-            'batch_size':2,
-            'depth':4 } 
-    model = ScalingVAE3( in_channels=model_param['in_channels'], 
-            latent_dim=model_param['latent_dim'], 
-            base=model_param['base'],
-            depth=model_param['depth'] )
-    model(x)
+            'num_cond_tokens':128,
+            'token_dim':20,
+            'time_dim':20,
+            'batch_size':64,
+            'cond_dim':20,
+            'T':1000 } 
+    
+    model = TinyLatentDiffusion(
+        in_channels=model_param['in_channels'],
+        base_channels=model_param['base'],
+        cond_dim=model_param['cond_dim'],
+        num_cond_tokens=model_param['num_cond_tokens'],  # 의미 단위로 늘릴수록 cross-attn 효과 커짐
+        token_dim=model_param['token_dim'],
+        time_dim=model_param['time_dim'],
+    )
+
+    sched = DDPMScheduler(T=model_param['T'])
+    x_t = torch.randn(2, 3, 4, 4)   # [16,3,64,64]
+    t = torch.randn(2, )   # [16,3,64,64]
+    cond = torch.randn(2, 20)   # [16,3,64,64]
+    model( x_t, t, cond)

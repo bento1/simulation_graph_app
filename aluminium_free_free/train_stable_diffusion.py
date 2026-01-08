@@ -1,15 +1,16 @@
 import torch
 import torch.nn.functional as F
 from fem_dataset_to_image_full_mesh_diffusion import FemImageDataset as MeshDataset
-from fem_model import ScalingVAE3
+from fem_model import TinyLatentDiffusion,DDPMScheduler,ScalingVAE3
 import json
 from torch.utils.data import DataLoader
 from utils import EarlyStopping
 import gc
 import numpy as np
 import matplotlib.pyplot as plt
-
-
+import os
+import torch
+import torch.nn as nn
 early_stopping = EarlyStopping(
     patience=50,     # FEM/GNN은 15~30 권장
     min_delta=1e-6,  # loss 스케일에 맞게
@@ -83,9 +84,9 @@ def kl_divergence_gaussian(mu, logvar, clamp=(-10, 10)):
     return kl.mean()
 
 def charbonnier_loss(pred: torch.Tensor,
-                     target: torch.Tensor,
-                     eps: float = 1e-8,
-                     reduction: str = "mean") -> torch.Tensor:
+                    target: torch.Tensor,
+                    eps: float = 1e-8,
+                    reduction: str = "mean") -> torch.Tensor:
     """
     Charbonnier loss (a smooth L1 / pseudo-Huber variant):
         L = sqrt((pred - target)^2 + eps^2)
@@ -112,28 +113,23 @@ def charbonnier_loss(pred: torch.Tensor,
         return loss
     raise ValueError("reduction must be one of {'mean','sum','none'}")
 
-def cvae_loss(x, scaled_x_hat, x_hat, mu, logvar, beta=1e-3):
-    mean = x.mean(dim=(1,2,3), keepdim=True) 
-    std = x.std(dim=(1,2,3), keepdim=True) + 1e-6 
-    x_norm=(x-mean)/std 
-    recon = charbonnier_loss(x, x_hat) 
-    recon_detail = charbonnier_loss(x_norm,scaled_x_hat)
-    kl = kl_divergence_gaussian(mu, logvar) 
-    scale=recon.mean().item()/recon_detail.mean().item() 
-    return 0.4*recon + 0.5*recon_detail + beta * kl, {"recon": recon.detach(),"recon_detail":recon_detail.detach(), "kl": kl.detach()}
-def draw_latent(mu, logvar, clamp=(-10, 10)): 
-    if clamp is not None: 
-        logvar = torch.clamp(logvar, min=clamp[0], max=clamp[1]) 
-        mu = mu.view(mu.size(0), -1) 
-        logvar = logvar.view(logvar.size(0), -1) 
-        plt.figure(figsize=(8, 4)) 
-        plt.subplot(1, 2, 1) 
-        plt.hist(mu.flatten().detach().cpu(), bins=100) 
-        plt.subplot(1, 2, 2) 
-        plt.hist(logvar.flatten().detach().cpu(), bins=100) 
-        plt.title("Image 1") 
-        plt.show()
-def train_one_epoch(model, loader, device, opt, model_param,epoch): 
+def diffusion_loss_ddpm(model: nn.Module, x0: torch.Tensor, cond: torch.Tensor, sched: DDPMScheduler):
+    """
+    x0:   (B,C,4,4) clean latent
+    cond: (B,Z)
+    """
+    device = x0.device
+    B = x0.size(0)
+
+    t = torch.randint(0, sched.T, (B,), device=device, dtype=torch.long)
+    noise = torch.randn_like(x0)
+    x_t = sched.q_sample(x0, t, noise)
+
+    eps_hat = model(x_t, t, cond)
+    return charbonnier_loss(eps_hat, noise)
+
+
+def train_one_epoch(model, loader, device, opt, model_param,epoch,VAE_model,sched): 
     model.train() 
     total = 0.0 
     count=0 
@@ -146,24 +142,32 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            scaled_x_hat,x_hat, mu, logvar, _ = model(s_batch['image']) 
-            loss, parts = cvae_loss(s_batch['image'], scaled_x_hat,x_hat, mu, logvar, beta=beta) 
+            scaled_image,iamge, mu, logvar, z =VAE_model.encoder(s_batch['image'])
+            loss = diffusion_loss_ddpm(model, z, s_batch['cond'], sched) 
             opt.zero_grad() 
             loss.backward() 
             opt.step() 
             total += float(loss.item())
             count+=1 
             if count % 50 == 0: 
-                print('[TRAIN] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'recon_detail loss: ', parts['recon_detail'] ,'kl loss: ', parts['kl']) 
+                print('[TRAIN] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),) 
                 origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
-                pred_image=x_hat[0,:][(model_param['in_channels']-1)//2].cpu()
-                draw_latent(mu, logvar, clamp=(-10, 10))
+                _ , C, H, W =z.shape
+                x0_generated = sched.p_sample_loop(
+                                model=model,
+                                shape=(1, C, H, W),
+                                cond=s_batch['cond'][0,:],
+                                device=device,
+                                return_all=False
+)
+                scaled_image,iamge  = VAE_model.decoder(x0_generated)
+                pred_image=iamge[0,:][(model_param['in_channels']-1)//2].cpu()
                 draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
     return total / max(1, count)
 @torch.no_grad()
-def eval_one_epoch(model, loader, device,  model_param,epoch):
+def eval_one_epoch(model, loader, device,  model_param,epoch,VAE_model,sched):
     model.eval()
     total = 0.0 
     count=0 
@@ -176,14 +180,23 @@ def eval_one_epoch(model, loader, device,  model_param,epoch):
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            scaled_x_hat,x_hat, mu, logvar, _ = model(s_batch['image']) 
-            loss, parts = cvae_loss(s_batch['image'], scaled_x_hat,x_hat, mu, logvar, beta=beta) 
+            scaled_image,iamge, mu, logvar, z =VAE_model.encoder(s_batch['image'])
+            loss = diffusion_loss_ddpm(model, z, s_batch['cond'], sched) 
             total += float(loss.item())
             count+=1 
             if count % 50 == 0: 
-                print('[VALID] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),'kl loss: ', parts['kl']) 
+                print('[VALID] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),) 
                 origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
-                pred_image=x_hat[0,:][(model_param['in_channels']-1)//2].cpu()
+                _ , C, H, W =z.shape
+                x0_generated = sched.p_sample_loop(
+                                model=model,
+                                shape=(1, C, H, W),
+                                cond=s_batch['cond'][0,:],
+                                device=device,
+                                return_all=False
+)
+                scaled_image,iamge  = VAE_model.decoder(x0_generated)
+                pred_image=iamge[0,:][(model_param['in_channels']-1)//2].cpu()
                 draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
@@ -205,10 +218,14 @@ def main():
                 'learning_rate':1e-3,
                 'num_epochs':1000,
                 'base':256,
-                'latent_dim':128,
+                'num_cond_tokens':128,
+                'token_dim':128,
+                'time_dim':128,
                 'batch_size':64,
-                'depth':4 } 
-    
+                'T':1000 } 
+    with open(os.path.join( "model_param_diffustion_vae4_early.json"), "r", encoding="utf-8") as f:
+        VAE_model_param = json.load(f)
+
     train_ds = MeshDataset(root_dir=root,type='train',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
     val_ds= MeshDataset(root_dir=root,type='valid',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
 
@@ -218,28 +235,43 @@ def main():
     model_param['cond_dim']=len(example['cond'][0]) 
     model_param['dataset_scale_info']=train_ds.scale_info 
 
-    model = ScalingVAE3( in_channels=model_param['in_channels'], 
-                latent_dim=model_param['latent_dim'], 
-                base=model_param['base'],
-                depth=model_param['depth'] ).to(device)
+    
+    VAE_model = ScalingVAE3( in_channels=VAE_model_param['in_channels'], 
+                latent_dim=VAE_model_param['latent_dim'], 
+                base=VAE_model_param['base'],
+                depth=VAE_model_param['depth'] ).to(device)
+    ckpt = torch.load("mesh_invariant_diffustion_vae4_early.pt", map_location="cpu")
+    VAE_model.load_state_dict(ckpt["model"])
+    for p in VAE_model.parameters():
+        p.requires_grad = False
 
+    model = TinyLatentDiffusion(
+        in_channels=model_param['in_channels'],
+        base_channels=model_param['base'],
+        cond_dim=model_param['cond_dim'],
+        num_cond_tokens=model_param['num_cond_tokens'],  # 의미 단위로 늘릴수록 cross-attn 효과 커짐
+        token_dim=model_param['token_dim'],
+        time_dim=model_param['time_dim'],
+    ).to(device)
+
+    sched = DDPMScheduler(T=model_param['T']).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=model_param['learning_rate'], weight_decay=1e-6)
     loss_dict={}
     for epoch in range(model_param['num_epochs']):        
-        train_loss = train_one_epoch(model, train_loader, device, optimizer,model_param,epoch)
-        val_loss = eval_one_epoch(model, val_loader, device,model_param,epoch)
+        train_loss = train_one_epoch(model, train_loader, device, optimizer,model_param,epoch,VAE_model,sched)
+        val_loss = eval_one_epoch(model, val_loader, device,model_param,epoch,VAE_model,sched)
         loss_dict[epoch] = {'train_loss':train_loss, 'val_loss':val_loss}   
         print(f"Epoch {epoch+1}/{model_param['num_epochs']}, Train Loss: {train_loss:.6e}, Val Loss: {val_loss:.6e}")  
         improved = early_stopping.step(val_loss)
-        with open(f"loss_history_diffustion_vae4.json", "w", encoding="utf-8") as f:
+        with open(f"loss_history_stable_diffustion_ver1.json", "w", encoding="utf-8") as f:
             json.dump(loss_dict, f, indent=2)
         if improved:
             best_val = val_loss
             # print(eval_one_epoch_sample_mse(model, val_loader, device, sched))
-            torch.save(model.state_dict(), "mesh_invariant_diffustion_vae4_early.pt")  # best만 저장
+            torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver1_early.pt")  # best만 저장
 
-            with open(f"model_param_diffustion_vae4_early.json", "w", encoding="utf-8") as f:
+            with open(f"model_param_stable_diffustion_ver1_early.json", "w", encoding="utf-8") as f:
                 json.dump(model_param, f, indent=2)
         if early_stopping.should_stop:
             print(
@@ -248,9 +280,9 @@ def main():
             )
             break
         if epoch%10==0:
-            torch.save(model.state_dict(), "mesh_invariant_diffustion_vae4.pt")
-    torch.save(model.state_dict(), "mesh_invariant_diffustion_vae4.pt")
-    with open(f"model_param_diffusion_vae4.json", "w", encoding="utf-8") as f:
+            torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver14.pt")
+    torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver1.pt")
+    with open(f"model_param_stable_diffustion_ver1.json", "w", encoding="utf-8") as f:
         json.dump(model_param, f, indent=2) 
 
 if __name__ == "__main__":
