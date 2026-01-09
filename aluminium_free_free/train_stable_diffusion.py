@@ -241,7 +241,7 @@ def main():
                 base=VAE_model_param['base'],
                 depth=VAE_model_param['depth'] ).to(device)
     ckpt = torch.load("mesh_invariant_diffustion_vae4_early.pt", map_location="cpu")
-    VAE_model.load_state_dict(ckpt["model"])
+    VAE_model.load_state_dict(ckpt)
     for p in VAE_model.parameters():
         p.requires_grad = False
 

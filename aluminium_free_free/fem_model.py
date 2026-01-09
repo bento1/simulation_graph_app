@@ -1350,7 +1350,7 @@ class EncoderConvZ(nn.Module):
     
     def forward(self, x):
         h = self.conv(x) 
-        logvar = torch.clamp(self.conv_logvar(h), min=-10, max=10)
+        logvar = torch.clamp(self.conv_logvar(h), min=-1, max=1)
         return self.conv_mu(h), logvar 
 
 def reparameterize(mu, logvar): 
