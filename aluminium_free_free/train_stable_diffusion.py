@@ -180,7 +180,7 @@ def eval_one_epoch(model, loader, device,  model_param,epoch,VAE_model,sched):
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
             mean = s_batch['image'].mean(dim=(1,2,3), keepdim=True).detach() 
-            std = s_batch['image'].std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
+            std = s_batch['image'].std(dim=(1,2,3), keepdim=True).detach()
             x_norm=(s_batch['image']-mean)/std 
             mu, logvar = VAE_model.encoder(x_norm) 
             z = reparameterize(mu, logvar) 

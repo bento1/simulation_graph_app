@@ -1431,7 +1431,9 @@ class ScalingDecoderConvZ4(nn.Module):
     def forward(self, latent): 
         z_q = latent[:, :self.latent_dim] # [B, Z] 
         mean = latent[:, self.latent_dim:self.latent_dim+1] # [B,1] 
-        std = latent[:, self.latent_dim+1:self.latent_dim+2] # [B,1] 
+        std = latent[:, self.latent_dim+1:self.latent_dim+2] # [B,1]
+        mean=self.inv_norm_mean(mean)
+        std=self.inv_norm_std(std)
         scaled_image=self.conv(z_q) 
         B,C,X,Y=scaled_image.shape 
         mean=mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
@@ -1456,7 +1458,7 @@ class ScalingVAE4(nn.Module):
         return s
     def forward(self, x): 
         mean = x.mean(dim=(1,2,3), keepdim=True).detach() 
-        std = x.std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
+        std = x.std(dim=(1,2,3), keepdim=True).detach()
         x_norm=(x-mean)/std 
         mu, logvar = self.encoder(x_norm) 
         z = reparameterize(mu, logvar) 
@@ -1573,6 +1575,76 @@ class DDPMScheduler:
                 xs.append(x)
 
         return xs if return_all else x
+    def extract(self,a, t, x_shape):
+        # a: [T], t: [B]
+        out = a.gather(0, t)
+        return out.view(-1, *([1] * (len(x_shape) - 1)))
+    def v_target(self, x0, noise, t):
+        alpha_bars=self.alphas_cumprod
+        ab = self.extract(alpha_bars, t, x0.shape)
+        return torch.sqrt(ab) * noise - torch.sqrt(1.0 - ab) * x0
+    
+    def predict_x0_from_v(self, x_t, v, t):
+        ab = self.extract(self.alphas_cumprod, t, x_t.shape)
+        return (torch.sqrt(ab) * x_t - torch.sqrt(1.0 - ab) * v) / torch.clamp(ab, min=1e-8)
+
+    @torch.no_grad()
+    def p_sample_v(self, model, x, t, cond):
+        """
+        One reverse step: x_t -> x_{t-1} using v-prediction
+        """
+        # model predicts v
+        v_pred = model(x, t, cond)
+
+        # x0 estimate
+        x0_hat = self.predict_x0_from_v(x, v_pred, t)
+
+        # coefficients
+        beta_t = self.extract(self.betas, t, x.shape)
+        alpha_t = 1.0 - beta_t
+        ab_t = self.extract(self.alphas_cumprod, t, x.shape)
+        ab_prev = self.extract(self.alphas_cumprod_prev, t, x.shape)
+
+        # DDPM posterior mean
+        coef1 = torch.sqrt(ab_prev) * beta_t / (1.0 - ab_t)
+        coef2 = torch.sqrt(alpha_t) * (1.0 - ab_prev) / (1.0 - ab_t)
+        mean = coef1 * x0_hat + coef2 * x
+
+        # noise
+        noise = torch.randn_like(x)
+        nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+
+        return mean + nonzero_mask * torch.sqrt(beta_t) * noise
+
+    @torch.no_grad()
+    def p_sample_loop_v(
+        self,
+        model,
+        shape,
+        cond: torch.Tensor,
+        device=None,
+        return_all=False
+    ):
+        """
+        Start from x_T ~ N(0, I), iterate t=T-1..0 (v-prediction)
+        """
+        device = device or cond.device
+        B = shape[0]
+
+        # x_T
+        x = torch.randn(shape, device=device)
+
+        xs = [x] if return_all else None
+
+        for ti in reversed(range(self.T)):
+            t = torch.full((B,), ti, device=device, dtype=torch.long)
+            x = self.p_sample_v(model, x, t, cond)
+
+            if return_all:
+                xs.append(x)
+
+        return xs if return_all else x
+
 class CondTokens(nn.Module):
     """
     cond: (B, Z)  -> tokens: (B, N, d)
