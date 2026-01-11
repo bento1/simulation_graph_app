@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from fem_dataset_to_image_full_mesh_diffusion import FemImageDataset as MeshDataset
-from fem_model import TinyLatentDiffusion,DDPMScheduler,ScalingVAE3
+from fem_model import TinyLatentDiffusion,DDPMScheduler,ScalingVAE3,reparameterize
 import json
 from torch.utils.data import DataLoader
 from utils import EarlyStopping
@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import os
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 early_stopping = EarlyStopping(
     patience=50,     # FEM/GNN은 15~30 권장
     min_delta=1e-6,  # loss 스케일에 맞게
@@ -133,16 +134,19 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch,VAE_model,sche
     model.train() 
     total = 0.0 
     count=0 
-    beta_target=1e-1
-    warmup_epochs=10 
-    warm = min(1.0, (epoch + 1) / max(1, warmup_epochs)) 
-    beta = beta_target * warm 
     for i, batch in enumerate(loader): 
         imags=batch['image'] 
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            scaled_image,iamge, mu, logvar, z =VAE_model.encoder(s_batch['image'])
+            
+            mean = s_batch['image'].mean(dim=(1,2,3), keepdim=True).detach() 
+            std = s_batch['image'].std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
+            x_norm=(s_batch['image']-mean)/std 
+            mu, logvar = VAE_model.encoder(x_norm) 
+            z = reparameterize(mu, logvar) 
+            B,C,X,Y=z.shape 
+            z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
             loss = diffusion_loss_ddpm(model, z, s_batch['cond'], sched) 
             opt.zero_grad() 
             loss.backward() 
@@ -151,17 +155,16 @@ def train_one_epoch(model, loader, device, opt, model_param,epoch,VAE_model,sche
             count+=1 
             if count % 50 == 0: 
                 print('[TRAIN] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),) 
-                origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
+                origin_image=torch.stack(imags[b])[0,:][(model_param['dataset_in_channels']-1)//2] 
                 _ , C, H, W =z.shape
                 x0_generated = sched.p_sample_loop(
                                 model=model,
                                 shape=(1, C, H, W),
-                                cond=s_batch['cond'][0,:],
+                                cond=s_batch['cond'][0,:].unsqueeze(0),
                                 device=device,
-                                return_all=False
-)
+                                return_all=False)
                 scaled_image,iamge  = VAE_model.decoder(x0_generated)
-                pred_image=iamge[0,:][(model_param['in_channels']-1)//2].cpu()
+                pred_image=iamge[0,:][(model_param['dataset_in_channels']-1)//2].cpu()
                 draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
@@ -171,32 +174,34 @@ def eval_one_epoch(model, loader, device,  model_param,epoch,VAE_model,sched):
     model.eval()
     total = 0.0 
     count=0 
-    beta_target=1e-1
-    warmup_epochs=10 
-    warm = min(1.0, (epoch + 1) / max(1, warmup_epochs)) 
-    beta = beta_target * warm 
     for i, batch in enumerate(loader): 
         imags=batch['image'] 
         conds=batch['cond'] 
         for b in range(len(imags)): 
             s_batch = {'image':torch.stack(imags[b]).to(device),'cond':torch.Tensor(np.array(conds[b])).to(device)} 
-            scaled_image,iamge, mu, logvar, z =VAE_model.encoder(s_batch['image'])
+            mean = s_batch['image'].mean(dim=(1,2,3), keepdim=True).detach() 
+            std = s_batch['image'].std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
+            x_norm=(s_batch['image']-mean)/std 
+            mu, logvar = VAE_model.encoder(x_norm) 
+            z = reparameterize(mu, logvar) 
+            B,C,X,Y=z.shape 
+            z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
             loss = diffusion_loss_ddpm(model, z, s_batch['cond'], sched) 
             total += float(loss.item())
             count+=1 
             if count % 50 == 0: 
                 print('[VALID] epoch: ',epoch,'batch: ',i,'step: ',count,'loss: ',float(loss.item()),) 
-                origin_image=torch.stack(imags[b])[0,:][(model_param['in_channels']-1)//2] 
+                origin_image=torch.stack(imags[b])[0,:][(model_param['dataset_in_channels']-1)//2] 
                 _ , C, H, W =z.shape
                 x0_generated = sched.p_sample_loop(
                                 model=model,
                                 shape=(1, C, H, W),
-                                cond=s_batch['cond'][0,:],
+                                cond=s_batch['cond'][0,:].unsqueeze(0),
                                 device=device,
                                 return_all=False
 )
                 scaled_image,iamge  = VAE_model.decoder(x0_generated)
-                pred_image=iamge[0,:][(model_param['in_channels']-1)//2].cpu()
+                pred_image=iamge[0,:][(model_param['dataset_in_channels']-1)//2].cpu()
                 draw(origin_image,pred_image,model_param) 
         del batch 
         gc.collect() 
@@ -211,7 +216,9 @@ def main():
     else :
         device='cpu'
 
-    model_param={ 'in_channels':3, 
+    model_param={
+                'dataset_in_channels':3,  
+                'in_channels':256, 
                 'out_channels':3,
                 'GRID':64,
                 'loss_scale':1.0,
@@ -221,18 +228,18 @@ def main():
                 'num_cond_tokens':128,
                 'token_dim':128,
                 'time_dim':128,
-                'batch_size':64,
+                'batch_size':4,
                 'T':1000 } 
-    with open(os.path.join( "model_param_diffustion_vae4_early.json"), "r", encoding="utf-8") as f:
+    with open(os.path.join( "model_param_diffustion_vae4_2_early.json"), "r", encoding="utf-8") as f:
         VAE_model_param = json.load(f)
 
-    train_ds = MeshDataset(root_dir=root,type='train',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
-    val_ds= MeshDataset(root_dir=root,type='valid',GRID=model_param['GRID'],in_channels=model_param['in_channels']) 
+    train_ds = MeshDataset(root_dir=root,type='train',GRID=model_param['GRID'],in_channels=model_param['dataset_in_channels']) 
+    val_ds= MeshDataset(root_dir=root,type='valid',GRID=model_param['GRID'],in_channels=model_param['dataset_in_channels']) 
 
     train_loader = DataLoader(train_ds, batch_size=model_param['batch_size'], shuffle=True, collate_fn=collate_flatten) 
     val_loader = DataLoader(val_ds, batch_size=model_param['batch_size'], shuffle=False, collate_fn=collate_flatten) 
     example = train_ds[0] 
-    model_param['cond_dim']=len(example['cond'][0]) 
+    model_param['cond_dim']=len(example['cond'][0])
     model_param['dataset_scale_info']=train_ds.scale_info 
 
     
@@ -240,13 +247,17 @@ def main():
                 latent_dim=VAE_model_param['latent_dim'], 
                 base=VAE_model_param['base'],
                 depth=VAE_model_param['depth'] ).to(device)
-    ckpt = torch.load("mesh_invariant_diffustion_vae4_early.pt", map_location="cpu")
+    print('[LOAD[START] VAE param')
+    ckpt = torch.load("mesh_invariant_diffustion_vae4_2_early_epoch019.pt", map_location=device)
     VAE_model.load_state_dict(ckpt)
-    for p in VAE_model.parameters():
+    
+    for p in tqdm(VAE_model.parameters()):
         p.requires_grad = False
-
+    print('[LOAD][COMPLETE] VAE param')
+    
     model = TinyLatentDiffusion(
-        in_channels=model_param['in_channels'],
+        in_channels=VAE_model_param['latent_dim']+2,
+        out_channels=VAE_model_param['in_channels'],
         base_channels=model_param['base'],
         cond_dim=model_param['cond_dim'],
         num_cond_tokens=model_param['num_cond_tokens'],  # 의미 단위로 늘릴수록 cross-attn 효과 커짐
@@ -280,7 +291,7 @@ def main():
             )
             break
         if epoch%10==0:
-            torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver14.pt")
+            torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver1.pt")
     torch.save(model.state_dict(), "mesh_invariant_stable_diffustion_ver1.pt")
     with open(f"model_param_stable_diffustion_ver1.json", "w", encoding="utf-8") as f:
         json.dump(model_param, f, indent=2) 

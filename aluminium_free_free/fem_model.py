@@ -1350,7 +1350,7 @@ class EncoderConvZ(nn.Module):
     
     def forward(self, x):
         h = self.conv(x) 
-        logvar = torch.clamp(self.conv_logvar(h), min=-1, max=1)
+        logvar = torch.clamp(self.conv_logvar(h), min=-0.3, max=0.3)
         return self.conv_mu(h), logvar 
 
 def reparameterize(mu, logvar): 
@@ -1392,10 +1392,76 @@ class ScalingVAE3(nn.Module):
     
     def forward(self, x): 
         mean = x.mean(dim=(1,2,3), keepdim=True).detach() 
-        std = x.std(dim=(1,2,3), keepdim=True).detach() + 1e-8 
+        std = x.std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
         x_norm=(x-mean)/std 
         mu, logvar = self.encoder(x_norm) 
         z = reparameterize(mu, logvar) 
+        B,C,X,Y=z.shape 
+        z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
+        scaled_image,iamge = self.decoder(z) 
+        return scaled_image,iamge, mu, logvar, z
+
+class ScalingDecoderConvZ4(nn.Module):
+    def __init__(self, out_channels, latent_dim, base, depth): 
+        super().__init__() 
+        self.latent_dim=latent_dim 
+        ch = latent_dim 
+        layers = [] 
+        for i in reversed(range(depth)): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+            layers.append(nn.SiLU()) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1))
+        self.conv = nn.Sequential(*layers) 
+        self.MAGIC_MEAN_MEAN=-0.18460561
+        self.MAGIC_MEAN_STD=0.0006700889
+        self.MAGIC_VAR_MEAN=-15.035463
+        self.MAGIC_VAR_STD=3.5190845
+    def inv_norm_mean(self, m):
+        m=self.MAGIC_MEAN_MEAN+m*self.MAGIC_MEAN_STD
+        return m
+    
+    def inv_norm_std(self,s):
+        s=s*self.MAGIC_VAR_STD+self.MAGIC_VAR_MEAN
+        s=torch.sqrt(torch.exp(s))
+        return s
+    def forward(self, latent): 
+        z_q = latent[:, :self.latent_dim] # [B, Z] 
+        mean = latent[:, self.latent_dim:self.latent_dim+1] # [B,1] 
+        std = latent[:, self.latent_dim+1:self.latent_dim+2] # [B,1] 
+        scaled_image=self.conv(z_q) 
+        B,C,X,Y=scaled_image.shape 
+        mean=mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        std=std[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        iamge=scaled_image*std.expand(B,C,X,Y)+mean.expand(B,C,X,Y) 
+        return scaled_image,iamge
+    
+class ScalingVAE4(nn.Module): 
+    def __init__( self, in_channels, latent_dim=128, base=64, depth=4 ): 
+        super().__init__() 
+        self.encoder = EncoderConvZ(in_channels, latent_dim, base, depth) 
+        self.decoder = ScalingDecoderConvZ4(in_channels, latent_dim, base, depth) 
+        self.MAGIC_MEAN_MEAN=-0.18460561
+        self.MAGIC_MEAN_STD=0.0006700889
+        self.MAGIC_VAR_MEAN=-15.035463
+        self.MAGIC_VAR_STD=3.5190845
+    def norm_mean(self, m):
+        m=(m-self.MAGIC_MEAN_MEAN)/self.MAGIC_MEAN_STD
+        return m
+    def norm_std(self,s):
+        s=(torch.log(s**2)-self.MAGIC_VAR_MEAN)/self.MAGIC_VAR_STD
+        return s
+    def forward(self, x): 
+        mean = x.mean(dim=(1,2,3), keepdim=True).detach() 
+        std = x.std(dim=(1,2,3), keepdim=True).detach() + 1e-12 
+        x_norm=(x-mean)/std 
+        mu, logvar = self.encoder(x_norm) 
+        z = reparameterize(mu, logvar) 
+        mean=self.norm_mean(mean)
+        std=self.norm_std(std)
         B,C,X,Y=z.shape 
         z = torch.cat([z, mean.expand(B,1,X,Y), std.expand(B,1,X,Y)], dim=1) # [B, Z+2] 
         scaled_image,iamge = self.decoder(z) 
@@ -1627,6 +1693,7 @@ class TinyLatentDiffusion(nn.Module):
     def __init__(
         self,
         in_channels: int,
+        out_channels:int,
         base_channels: int,
         cond_dim: int,          # Z
         num_cond_tokens: int,   # N
@@ -1651,14 +1718,14 @@ class TinyLatentDiffusion(nn.Module):
 
         self.rb1 = FiLMResBlock(base_channels, self.ctx_dim)
         self.rb2 = FiLMResBlock(base_channels, self.ctx_dim)
-
+        self.rb3 = FiLMResBlock(base_channels, self.ctx_dim)
         self.rb_mid = CrossAttnResBlock(base_channels, self.ctx_dim, token_dim, num_heads=4)
 
-        self.rb3 = FiLMResBlock(base_channels, self.ctx_dim)
         self.rb4 = FiLMResBlock(base_channels, self.ctx_dim)
-
+        self.rb5 = FiLMResBlock(base_channels, self.ctx_dim)
+        self.rb6 = FiLMResBlock(base_channels, self.ctx_dim)
         self.out_norm = nn.GroupNorm(8, base_channels)
-        self.out_proj = nn.Conv2d(base_channels, in_channels, 3, padding=1)
+        self.out_proj = nn.Conv2d(base_channels, in_channels, out_channels, padding=1)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor):
         """
@@ -1680,10 +1747,11 @@ class TinyLatentDiffusion(nn.Module):
         h = self.in_proj(x_t)
         h = self.rb1(h, ctx)
         h = self.rb2(h, ctx)
-        h = self.rb_mid(h, ctx, cond_tok)
         h = self.rb3(h, ctx)
+        h = self.rb_mid(h, ctx, cond_tok)
         h = self.rb4(h, ctx)
-
+        h = self.rb5(h, ctx)
+        h = self.rb6(h, ctx)
         h = F.silu(self.out_norm(h))
         eps_hat = self.out_proj(h)
         return eps_hat
