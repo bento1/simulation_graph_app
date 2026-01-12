@@ -4,14 +4,16 @@
   "out_channels": 3,
   "GRID": 64,
   "loss_scale": 1.0,
-  "learning_rate": 0.005,
+  "learning_rate": 0.001,
   "num_epochs": 1000,
   "base": 256,
   "num_cond_tokens": 128,
   "token_dim": 128,
   "time_dim": 128,
   "batch_size": 128,
-  "T": 1000,
+  "T": 500,
+  "beta_start": 0.0002,
+  "beta_end": 0.04,
   "cond_dim": 20,
   "dataset_scale_info": {
     "x": {

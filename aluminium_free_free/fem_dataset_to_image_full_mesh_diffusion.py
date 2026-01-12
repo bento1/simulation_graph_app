@@ -250,7 +250,7 @@ class FemImageDataset(Dataset):
             # image: (W,H,D,C) numpy 
             vol = torch.from_numpy(image).float() 
             vols.append(vol) 
-            params_list=[params[k] for k in sorted(params)] 
+            params_list=[params[k] for k in sorted(params) if key not in ['nx','ny','nz']] 
             params_list=[z_idx/self.GRID]+params_list 
             params_lists.append(params_list) 
 
@@ -261,7 +261,27 @@ class FemImageDataset(Dataset):
         
     def __getitem__(self, idx):
         return self._load_image(self.samples[idx])
-    
+#     {
+#   "Lx": 6,
+#   "Ly": 2,
+#   "Lz": 2,
+#   "nx": 16,
+#   "ny": 18,
+#   "nz": 10,
+#   "xm0": 0.9972,
+#   "xm1": 1.7471999999999999,
+#   "ym0": 0.36,
+#   "ym1": 0.5822222222222222,
+#   "zm0": 0,
+#   "zm1": 0.4,
+#   "E": 69000000000.0,
+#   "nu": 0.33,
+#   "rho": 2700,
+#   "m_add": 31,
+#   "freq": 262,
+#   "a_base": 15,
+#   "zeta": 0.005
+# }
 class FemImageInferenceDataset(Dataset):
     def __init__(self, root_dir: str, scale_info:dict ,GRID=256,in_channels=5):
         super().__init__()

@@ -4,7 +4,7 @@ from fem_dataset_to_image_full_mesh_diffusion import FemImageDataset as MeshData
 from fem_model import TinyLatentDiffusion,DDPMScheduler,ScalingVAE4,reparameterize
 import json
 from torch.utils.data import DataLoader
-from utils import EarlyStopping
+from utils import EarlyStopping, minmax_scale
 import gc
 import numpy as np
 import matplotlib.pyplot as plt
@@ -74,6 +74,15 @@ def train_one_epoch(loader, device,VAE_model,):
     drawHist(mean_result,np.log(std_result**2))
 
     drawHist((mean_result-mean_result.mean())/mean_result.std(),(np.log(std_result**2)-np.log(std_result**2).mean())/(np.log(std_result**2).std()))
+    mean_sacler_min=((mean_result-mean_result.mean())/mean_result.std()).min()
+    mean_sacler_max=((mean_result-mean_result.mean())/mean_result.std()).max()
+    std_scaler_min=((np.log(std_result**2)-np.log(std_result**2).mean())/(np.log(std_result**2).std())).min()
+    std_scaler_max=((np.log(std_result**2)-np.log(std_result**2).mean())/(np.log(std_result**2).std())).max()
+    scaled_mean=(mean_result-mean_result.mean())/mean_result.std()
+    scaled_std=(np.log(std_result**2)-np.log(std_result**2).mean())/(np.log(std_result**2).std())
+
+    drawHist((mean_result-mean_result.mean())/mean_result.std(),(np.log(std_result**2)-np.log(std_result**2).mean())/(np.log(std_result**2).std()))
+    drawHist(minmax_scale(scaled_mean,mean_sacler_min,mean_sacler_max,s=(-1,1)),minmax_scale(scaled_std,std_scaler_min,std_scaler_max,s=(-1,1)))
     return mean_result,std_result
 
 

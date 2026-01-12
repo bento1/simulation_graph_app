@@ -1418,13 +1418,26 @@ class ScalingDecoderConvZ4(nn.Module):
         self.conv = nn.Sequential(*layers) 
         self.MAGIC_MEAN_MEAN=-0.18460561
         self.MAGIC_MEAN_STD=0.0006700889
+        self.MAGIC_SCALED_MEAN_MIN=-16.384098
+        self.MAGIC_SCALED_MEAN_MAX=16.185783
         self.MAGIC_VAR_MEAN=-15.035463
         self.MAGIC_VAR_STD=3.5190845
+        self.MAGIC_SCALED_STD_MIN=-2.7833695
+        self.MAGIC_SCALED_STD_MAX=3.713802
+        
     def inv_norm_mean(self, m):
+        a=-1
+        b=1
+        m = (m - a) / (b - a)
+        m = m * (self.MAGIC_SCALED_MEAN_MAX - self.MAGIC_SCALED_MEAN_MIN) + self.MAGIC_SCALED_MEAN_MIN
         m=self.MAGIC_MEAN_MEAN+m*self.MAGIC_MEAN_STD
         return m
     
     def inv_norm_std(self,s):
+        a=-1
+        b=1
+        s = (s - a) / (b - a)
+        s = s * (self.MAGIC_SCALED_STD_MAX - self.MAGIC_SCALED_STD_MIN) + self.MAGIC_SCALED_STD_MIN
         s=s*self.MAGIC_VAR_STD+self.MAGIC_VAR_MEAN
         s=torch.sqrt(torch.exp(s))
         return s
@@ -1448,14 +1461,30 @@ class ScalingVAE4(nn.Module):
         self.decoder = ScalingDecoderConvZ4(in_channels, latent_dim, base, depth) 
         self.MAGIC_MEAN_MEAN=-0.18460561
         self.MAGIC_MEAN_STD=0.0006700889
+        self.MAGIC_SCALED_MEAN_MIN=-16.384098
+        self.MAGIC_SCALED_MEAN_MAX=16.185783
         self.MAGIC_VAR_MEAN=-15.035463
         self.MAGIC_VAR_STD=3.5190845
+        self.MAGIC_SCALED_STD_MIN=-2.7833695
+        self.MAGIC_SCALED_STD_MAX=3.713802
+        
+        
     def norm_mean(self, m):
+        a=-1
+        b=1
         m=(m-self.MAGIC_MEAN_MEAN)/self.MAGIC_MEAN_STD
+        m=     (m - self.MAGIC_SCALED_MEAN_MIN) / (self.MAGIC_SCALED_MEAN_MAX - self.MAGIC_SCALED_MEAN_MIN)
+        m = m * (b - a) + a
         return m
+    
     def norm_std(self,s):
+        a=-1
+        b=1
         s=(torch.log(s**2)-self.MAGIC_VAR_MEAN)/self.MAGIC_VAR_STD
+        s=     (s- self.MAGIC_SCALED_STD_MIN) / (self.MAGIC_SCALED_STD_MAX - self.MAGIC_SCALED_STD_MIN)
+        s = s * (b - a) + a
         return s
+    
     def forward(self, x): 
         mean = x.mean(dim=(1,2,3), keepdim=True).detach() 
         std = x.std(dim=(1,2,3), keepdim=True).detach()
@@ -1586,7 +1615,7 @@ class DDPMScheduler:
     
     def predict_x0_from_v(self, x_t, v, t):
         ab = self.extract(self.alphas_cumprod, t, x_t.shape)
-        return (torch.sqrt(ab) * x_t - torch.sqrt(1.0 - ab) * v) / torch.clamp(ab, min=1e-8)
+        return (torch.sqrt(ab) * x_t - torch.sqrt(1.0 - ab) * v) 
 
     @torch.no_grad()
     def p_sample_v(self, model, x, t, cond):
@@ -1614,8 +1643,8 @@ class DDPMScheduler:
         noise = torch.randn_like(x)
         nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
 
-        return mean + nonzero_mask * torch.sqrt(beta_t) * noise
-
+        posterior_var = self.extract(self.posterior_variance, t, x.shape)
+        return mean + nonzero_mask * torch.sqrt(posterior_var) * noise
     @torch.no_grad()
     def p_sample_loop_v(
         self,
@@ -1788,15 +1817,13 @@ class TinyLatentDiffusion(nn.Module):
 
         self.in_proj = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
-        self.rb1 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.rb2 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.rb3 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.rb_mid = CrossAttnResBlock(base_channels, self.ctx_dim, token_dim, num_heads=4)
-
-        self.rb4 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.rb5 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.rb6 = FiLMResBlock(base_channels, self.ctx_dim)
-        self.out_norm = nn.GroupNorm(8, base_channels)
+        layers=[]
+        for _ in range(4):
+            layers.append(FiLMResBlock(base_channels, self.ctx_dim))
+            layers.append(CrossAttnResBlock(base_channels, self.ctx_dim, token_dim, num_heads=4))
+            layers.append(nn.GroupNorm(8, base_channels))
+            layers.append(nn.SiLU())
+        self.body=nn.ModuleList(layers)
         self.out_proj = nn.Conv2d(base_channels, in_channels, out_channels, padding=1)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor):
@@ -1817,14 +1844,15 @@ class TinyLatentDiffusion(nn.Module):
         cond_tok = self.cond_tokens(cond)   # (B, N, d)
 
         h = self.in_proj(x_t)
-        h = self.rb1(h, ctx)
-        h = self.rb2(h, ctx)
-        h = self.rb3(h, ctx)
-        h = self.rb_mid(h, ctx, cond_tok)
-        h = self.rb4(h, ctx)
-        h = self.rb5(h, ctx)
-        h = self.rb6(h, ctx)
-        h = F.silu(self.out_norm(h))
+
+        for block in self.body:
+            if isinstance(block, CrossAttnResBlock):
+                h = block(h, ctx,cond_tok)
+            elif isinstance(block, FiLMResBlock):
+                h = block(h, ctx )
+            else:
+                h = block(h)
+
         eps_hat = self.out_proj(h)
         return eps_hat
 
