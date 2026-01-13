@@ -1857,23 +1857,90 @@ class TinyLatentDiffusion(nn.Module):
         return eps_hat
 
 
+
+
+class ScalingDecoderConvZ5(nn.Module):
+    def __init__(self, out_channels, latent_dim, base, depth): 
+        super().__init__() 
+        self.latent_dim=latent_dim 
+        ch = latent_dim -2 
+        layers = [] 
+        for i in reversed(range(depth)): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+            layers.append(nn.SiLU()) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
+        self.conv = nn.Sequential(*layers) 
+        layers2=[] 
+        layers3=[] 
+        for i in range(depth): 
+            if i ==0: 
+                layers2.append(ResBlock(1, base)) 
+                layers3.append(ResBlock(1, base)) 
+            else: 
+                layers2.append(ResBlock(base, base)) 
+                layers3.append(ResBlock(base, base)) 
+        layers2.append(ResBlock(base, 1)) 
+        layers3.append(ResBlock(base, 1)) 
+        layers2.append(nn.AdaptiveAvgPool2d((1,1))) 
+        layers3.append(nn.AdaptiveAvgPool2d((1,1))) 
+        self.image_mean_conv=nn.Sequential(*layers2) 
+        self.image_logvar_conv=nn.Sequential(*layers3) 
+
+    def forward(self, latent): 
+        z_q = latent[:, :self.latent_dim-2] # [B, Z] 
+        image_mean = latent[:, self.latent_dim-2:self.latent_dim-1] # [B,1] 
+        image_logvar = latent[:, self.latent_dim-1:] # [B,1] 
+        image_mean=self.image_mean_conv(image_mean)# [B,1] 
+        image_logvar=self.image_logvar_conv(image_logvar)# [B,1] 
+        std=torch.exp(0.5*image_logvar)# [B,1] 
+        scaled_image=self.conv(z_q)
+        B,C,X,Y=scaled_image.shape 
+        mean=image_mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        std=std[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
+        iamge=scaled_image*std.expand(B,C,X,Y)+mean.expand(B,C,X,Y) 
+        return scaled_image,iamge,image_mean,image_logvar
+class EncoderConvZ5(nn.Module): 
+    def __init__(self, in_channels, latent_dim, base, depth): 
+        super().__init__() 
+        layers = [] 
+        ch = in_channels 
+        for i in range(depth): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(nn.AvgPool2d(2)) 
+            ch = out_ch 
+        
+        self.conv = nn.Sequential(*layers) 
+        self.conv_mu = nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
+        self.conv_logvar =nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
+    
+    def forward(self, x):
+        h = self.conv(x) 
+        logvar = torch.clamp(self.conv_logvar(h), min=-0.3, max=0.3)
+        return self.conv_mu(h), logvar 
+
+def reparameterize(mu, logvar): 
+    std = torch.exp(0.5 * logvar) 
+    eps = torch.randn_like(std) 
+    return mu + eps * std
+class ScalingVAE5(nn.Module): 
+    def __init__( self, in_channels, latent_dim=128, base=64, depth=4 ): 
+        super().__init__() 
+        self.encoder = EncoderConvZ5(in_channels, latent_dim, base, depth) 
+        self.decoder = ScalingDecoderConvZ5(in_channels, latent_dim, base, depth) 
+
+    def forward(self, x): 
+        mu, logvar = self.encoder(x) 
+        z = reparameterize(mu, logvar) 
+        scaled_image,iamge,image_mean,image_var = self.decoder(z) 
+        return scaled_image,iamge,image_mean,image_var, mu, logvar, z
+    
 if  __name__=='__main__':
-    # x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
-    # model_param={ 'in_channels':3, 
-    #         'out_channels':3,
-    #         'GRID':64,
-    #         'loss_scale':1.0,
-    #         'learning_rate':1e-3,
-    #         'num_epochs':1000,
-    #         'base':256,
-    #         'latent_dim':16,
-    #         'batch_size':2,
-    #         'depth':4 } 
-    # model = ScalingVAE3( in_channels=model_param['in_channels'], 
-    #         latent_dim=model_param['latent_dim'], 
-    #         base=model_param['base'],
-    #         depth=model_param['depth'] )
-    # model(x)
+    x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
     model_param={ 'in_channels':3, 
             'out_channels':3,
             'GRID':64,
@@ -1881,24 +1948,39 @@ if  __name__=='__main__':
             'learning_rate':1e-3,
             'num_epochs':1000,
             'base':256,
-            'num_cond_tokens':128,
-            'token_dim':20,
-            'time_dim':20,
-            'batch_size':64,
-            'cond_dim':20,
-            'T':1000 } 
+            'latent_dim':16,
+            'batch_size':2,
+            'depth':4 } 
+    model = ScalingVAE5( in_channels=model_param['in_channels'], 
+            latent_dim=model_param['latent_dim'], 
+            base=model_param['base'],
+            depth=model_param['depth'] )
+    model(x)
+    # model_param={ 'in_channels':3, 
+    #         'out_channels':3,
+    #         'GRID':64,
+    #         'loss_scale':1.0,
+    #         'learning_rate':1e-3,
+    #         'num_epochs':1000,
+    #         'base':256,
+    #         'num_cond_tokens':128,
+    #         'token_dim':20,
+    #         'time_dim':20,
+    #         'batch_size':64,
+    #         'cond_dim':20,
+    #         'T':1000 } 
     
-    model = TinyLatentDiffusion(
-        in_channels=model_param['in_channels'],
-        base_channels=model_param['base'],
-        cond_dim=model_param['cond_dim'],
-        num_cond_tokens=model_param['num_cond_tokens'],  # 의미 단위로 늘릴수록 cross-attn 효과 커짐
-        token_dim=model_param['token_dim'],
-        time_dim=model_param['time_dim'],
-    )
+    # model = TinyLatentDiffusion(
+    #     in_channels=model_param['in_channels'],
+    #     base_channels=model_param['base'],
+    #     cond_dim=model_param['cond_dim'],
+    #     num_cond_tokens=model_param['num_cond_tokens'],  # 의미 단위로 늘릴수록 cross-attn 효과 커짐
+    #     token_dim=model_param['token_dim'],
+    #     time_dim=model_param['time_dim'],
+    # )
 
-    sched = DDPMScheduler(T=model_param['T'])
-    x_t = torch.randn(2, 3, 4, 4)   # [16,3,64,64]
-    t = torch.randn(2, )   # [16,3,64,64]
-    cond = torch.randn(2, 20)   # [16,3,64,64]
-    model( x_t, t, cond)
+    # sched = DDPMScheduler(T=model_param['T'])
+    # x_t = torch.randn(2, 3, 4, 4)   # [16,3,64,64]
+    # t = torch.randn(2, )   # [16,3,64,64]
+    # cond = torch.randn(2, 20)   # [16,3,64,64]
+    # model( x_t, t, cond)
