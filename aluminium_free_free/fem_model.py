@@ -1857,6 +1857,30 @@ class TinyLatentDiffusion(nn.Module):
         return eps_hat
 
 
+class LearnableSpatialReducer(nn.Module):
+    def __init__(self, base):
+        super().__init__()
+        self.conv = nn.Conv2d(1, base, kernel_size=1)
+        self.norm1 = nn.LayerNorm(base)
+        self.norm2 = nn.LayerNorm(base)
+        self.fc1 = nn.Linear(base, base)
+        self.fc2 = nn.Linear(base, base)
+        self.fc3 = nn.Linear(base, 1)
+
+    def forward(self, x):
+        # x: [B,1,H,W]
+        x = x.mean(dim=(2,3))      # global average (no params)
+        x = self.conv(x.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        h = self.fc1(x)
+        h = self.norm1(h)
+        h = F.silu(h)
+        h = h+x
+        h = self.fc2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = h+x
+        x = self.fc3(h)
+        return x.view(x.size(0),1,1,1)
 
 
 class ScalingDecoderConvZ5(nn.Module):
@@ -1874,21 +1898,8 @@ class ScalingDecoderConvZ5(nn.Module):
             ch = out_ch 
         layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
         self.conv = nn.Sequential(*layers) 
-        layers2=[] 
-        layers3=[] 
-        for i in range(depth): 
-            if i ==0: 
-                layers2.append(ResBlock(1, base)) 
-                layers3.append(ResBlock(1, base)) 
-            else: 
-                layers2.append(ResBlock(base, base)) 
-                layers3.append(ResBlock(base, base)) 
-        layers2.append(ResBlock(base, 1)) 
-        layers3.append(ResBlock(base, 1)) 
-        layers2.append(nn.AdaptiveAvgPool2d((1,1))) 
-        layers3.append(nn.AdaptiveAvgPool2d((1,1))) 
-        self.image_mean_conv=nn.Sequential(*layers2) 
-        self.image_logvar_conv=nn.Sequential(*layers3) 
+        self.image_mean_conv=LearnableSpatialReducer(base)
+        self.image_logvar_conv=LearnableSpatialReducer(base)
 
     def forward(self, latent): 
         z_q = latent[:, :self.latent_dim-2] # [B, Z] 
