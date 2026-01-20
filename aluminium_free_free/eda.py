@@ -7,6 +7,7 @@ import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 from torch_geometric.utils import k_hop_subgraph
+import matplotlib.pyplot as plt
 
 def cells_to_edges(cells_df: pd.DataFrame, undirected=True) -> np.ndarray:
     cols = ["node_0", "node_1", "node_2", "node_3"]
@@ -52,7 +53,8 @@ def build_edge_attr(edge_index: torch.Tensor, xyz: torch.Tensor, Lx, Ly, Lz) -> 
     dist = torch.norm(dvec, dim=1, keepdim=True) + 1e-12  # [E,1]
     edge_attr = torch.cat([dvec, dist], dim=1)/L            # [E,4]
     return edge_attr
-
+def signed_log(x):
+    return np.sign(x) * np.log1p(np.abs(x))
 
 def build_node_features(nodes_xyz: np.ndarray, params: dict) -> np.ndarray:
     N = nodes_xyz.shape[0]
@@ -78,26 +80,39 @@ class FemGraphDataset(Dataset):
         ])
         self.data_list = []
         self.scale_info={}
+        self.max_leng=0
         for sd in tqdm(self.samples):
             try:
-                self.find_data_info(sd)
+                self.find_full_data(sd)
             except Exception as e:
                 print(f"Error in finding data info for {sd}: {e}")
                 continue
-        print("Loading FEM graph dataset...")
-        for sd in tqdm(self.samples):
-            try:
-                full_data = self._load_full_graph(sd)
-                self.data_list.append(full_data)
-                
 
-            except Exception as e:
-                print(f"Error in loading graph for {sd}: {e}")
-                continue
-            # break
-        df=pd.DataFrame(self.data_list)
-        print("Build Complete FEM graph dataset...")
-    
+        plt.figure(0)
+        data=pd.concat(self.data_list)
+        for g, sub in data.groupby("name"):
+            plt.hist(sub["uz"], bins=10, alpha=0.6, label=g)
+        plt.xlabel("signed log(value)")
+        plt.show()
+        plt.figure(0)   
+        for g, sub in data.groupby("name"):
+            plt.hist(signed_log(sub["uz"]), bins=50, alpha=0.5, label=g)
+        plt.xlabel("signed log(value)")
+        plt.show()
+
+        center = data["uz"].abs() < 1e-9   # 기준은 데이터 보고 조절
+        plt.figure(0) 
+        for g, sub in data[center].groupby("name"):
+            plt.hist(sub["uz"], bins=50, alpha=0.6, label=g)
+
+        plt.title("Zoomed near mean")
+        plt.show()
+        plt.figure(figsize=(8, 4))
+        data.boxplot(column="uz", by="name", showfliers=True)
+        plt.title("Boxplot by Group")
+        plt.suptitle("")  # pandas 기본 제목 제거
+        plt.ylabel("value")
+        plt.show()
     def find_data_info(self,sd):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
@@ -143,6 +158,15 @@ class FemGraphDataset(Dataset):
                 M2=prev_std**2 * (prev_num -1) + del1 * del2
                 self.scale_info[key]['std']=np.sqrt(M2/(self.scale_info[key]['num']-1)) if self.scale_info[key]['num']>1 else 0
                 self.scale_info[key]['num']+=num_data
+    def find_full_data(self,sd):
+        disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
+
+        for key in ["uz"]:
+            mean_value=disp_df[key].values.tolist()
+            mean_value=pd.DataFrame(mean_value,columns=[key])
+            mean_value['name']=sd
+            self.data_list.append(mean_value)
+
     
     def len(self):
         return len(self.data_list)

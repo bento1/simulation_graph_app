@@ -1228,7 +1228,26 @@ class ResBlock(nn.Module):
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
         return self.act(h + self.skip(x))
+class ResBlockNoAct(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
 
+        self.norm1 = nn.BatchNorm2d(out_ch)
+        self.norm2 = nn.BatchNorm2d(out_ch)
+
+        self.act = nn.SiLU()
+
+        self.skip = (
+            nn.Conv2d(in_ch, out_ch, 1)
+            if in_ch != out_ch else nn.Identity()
+        )
+
+    def forward(self, x):
+        h = self.act(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
+        return h + self.skip(x)
 class Encoder(nn.Module):
     def __init__(self, in_channels, latent_dim, base, depth):
         super().__init__()
@@ -1611,7 +1630,7 @@ class DDPMScheduler:
     def v_target(self, x0, noise, t):
         alpha_bars=self.alphas_cumprod
         ab = self.extract(alpha_bars, t, x0.shape)
-        return torch.sqrt(ab) * noise - torch.sqrt(1.0 - ab) * x0
+        return (torch.sqrt(ab) * noise - torch.sqrt(1.0 - ab) * x0).detach()
     
     def predict_x0_from_v(self, x_t, v, t):
         ab = self.extract(self.alphas_cumprod, t, x_t.shape)
@@ -1882,12 +1901,37 @@ class LearnableSpatialReducer(nn.Module):
         x = self.fc3(h)
         return x.view(x.size(0),1,1,1)
 
+class LearnableDense(nn.Module):
+    def __init__(self, latent_dim,base):
+        super().__init__()
+        self.conv = nn.Conv2d(latent_dim, base, kernel_size=1)
+        self.norm1 = nn.LayerNorm(base)
+        self.norm2 = nn.LayerNorm(base)
+        self.fc1 = nn.Linear(base, base)
+        self.fc2 = nn.Linear(base, base)
+        self.fc3 = nn.Linear(base, 1)
+
+    def forward(self, x):
+        # x: [B,1,H,W]
+        x = x.mean(dim=(2,3))      # global average (no params)
+        x = self.conv(x.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        h = self.fc1(x)
+        h = self.norm1(h)
+        h = F.silu(h)
+        h = h+x
+        h = self.fc2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = h+x
+        x = self.fc3(h)
+        return x.view(x.size(0),1,1,1)
+
 
 class ScalingDecoderConvZ5(nn.Module):
     def __init__(self, out_channels, latent_dim, base, depth): 
         super().__init__() 
         self.latent_dim=latent_dim 
-        ch = latent_dim -2 
+        ch = latent_dim 
         layers = [] 
         for i in reversed(range(depth)): 
             out_ch = base * (2 ** i) 
@@ -1898,22 +1942,39 @@ class ScalingDecoderConvZ5(nn.Module):
             ch = out_ch 
         layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
         self.conv = nn.Sequential(*layers) 
-        self.image_mean_conv=LearnableSpatialReducer(base)
-        self.image_logvar_conv=LearnableSpatialReducer(base)
+        
+        self.image_mean_conv=LearnableDense(latent_dim,base)
 
+        ch = latent_dim 
+        layers = [] 
+        for i in reversed(range(depth)): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlockNoAct(ch, out_ch)) 
+            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
+        self.image_logvar_conv=nn.Sequential(*layers)  #LearnableSpatialReducer(base)
+        
+        layers = [] 
+        ch =out_channels
+        for i in reversed(range(depth)): 
+            layers.append(ResBlockNoAct(ch, base)) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
+
+        self.std_layers=nn.Sequential(*layers)  #LearnableSpatialReducer(base)
+    
     def forward(self, latent): 
-        z_q = latent[:, :self.latent_dim-2] # [B, Z] 
-        image_mean = latent[:, self.latent_dim-2:self.latent_dim-1] # [B,1] 
-        image_logvar = latent[:, self.latent_dim-1:] # [B,1] 
-        image_mean=self.image_mean_conv(image_mean)# [B,1] 
-        image_logvar=self.image_logvar_conv(image_logvar)# [B,1] 
-        std=torch.exp(0.5*image_logvar)# [B,1] 
-        scaled_image=self.conv(z_q)
-        B,C,X,Y=scaled_image.shape 
+        image_mean=self.image_mean_conv(latent)# [B,Z] ->B 1
+        image_logvar=self.image_logvar_conv(latent)# B,C,X,Y 
+        scaled_image=self.conv(latent)
+        B,C,X,Y=scaled_image.shape
         mean=image_mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
-        std=std[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
-        iamge=scaled_image*std.expand(B,C,X,Y)+mean.expand(B,C,X,Y) 
-        return scaled_image,iamge,image_mean,image_logvar
+        image=torch.matmul(scaled_image,image_logvar)
+        image=self.std_layers(image)+mean.expand(B,C,X,Y) 
+        return scaled_image,image
+
 class EncoderConvZ5(nn.Module): 
     def __init__(self, in_channels, latent_dim, base, depth): 
         super().__init__() 
@@ -1926,8 +1987,16 @@ class EncoderConvZ5(nn.Module):
             ch = out_ch 
         
         self.conv = nn.Sequential(*layers) 
-        self.conv_mu = nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
-        self.conv_logvar =nn.Conv2d( out_ch, latent_dim, kernel_size=3, stride=1, padding=1 ) 
+        layers_conv_mu = [] 
+        layers_conv_logvar = []
+        ch=out_ch
+        for i in range(depth): 
+            layers_conv_mu.append(ResBlock(ch, latent_dim)) 
+            layers_conv_logvar.append(ResBlock(ch, latent_dim))
+            ch = latent_dim 
+
+        self.conv_mu = nn.Sequential(*layers_conv_mu)
+        self.conv_logvar =nn.Sequential(*layers_conv_mu)
     
     def forward(self, x):
         h = self.conv(x) 
@@ -1944,12 +2013,84 @@ class ScalingVAE5(nn.Module):
         self.encoder = EncoderConvZ5(in_channels, latent_dim, base, depth) 
         self.decoder = ScalingDecoderConvZ5(in_channels, latent_dim, base, depth) 
 
+    def forward(self, x ): 
+        mu, logvar = self.encoder(x) 
+        z = reparameterize(mu, logvar) 
+        scaled_image,iamge = self.decoder(z) 
+        return scaled_image,iamge, mu, logvar, z
+
+
+class ScalingDecoderConvZ6(nn.Module):
+    def __init__(self, out_channels, latent_dim, base, depth): 
+        super().__init__() 
+        self.latent_dim=latent_dim 
+        ch = latent_dim
+        layers = [] 
+        for i in reversed(range(depth)): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+            layers.append(nn.SiLU()) 
+            ch = out_ch 
+        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
+        self.conv = nn.Sequential(*layers) 
+        # self.image_mean_conv=LearnableSpatialReducer(base)
+        # self.image_logvar_conv=LearnableSpatialReducer(base)
+
+    def forward(self, latent): 
+        image=self.conv(latent)
+        mean = image.mean(dim=(1,2,3), keepdim=True).detach()
+        std = image.std(dim=(1,2,3), keepdim=True).detach()+1e-12
+        image_logvar=torch.log(std**2)
+        scaled_image=(image-mean)/std 
+
+        return scaled_image,image,mean,image_logvar
+class EncoderConvZ6(nn.Module): 
+    def __init__(self, in_channels, latent_dim, base, depth): 
+        super().__init__() 
+        layers = [] 
+        ch = in_channels 
+        for i in range(depth): 
+            out_ch = base * (2 ** i) 
+            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(nn.AvgPool2d(2)) 
+            ch = out_ch 
+        
+        self.conv = nn.Sequential(*layers) 
+        
+        layers_conv_mu = [] 
+        layers_conv_logvar = []
+        ch=out_ch
+        for i in range(depth): 
+            layers_conv_mu.append(ResBlock(ch, latent_dim)) 
+            layers_conv_logvar.append(ResBlock(ch, latent_dim))
+            ch = latent_dim 
+
+        self.conv_mu = nn.Sequential(*layers_conv_mu)
+        self.conv_logvar =nn.Sequential(*layers_conv_mu)
+    
+    def forward(self, x):
+        h = self.conv(x) 
+        logvar = torch.clamp(self.conv_logvar(h), min=-10, max=10)
+        return self.conv_mu(h), logvar 
+
+def reparameterize(mu, logvar): 
+    std = torch.exp(0.5 * logvar) 
+    eps = torch.randn_like(std) 
+    return mu + eps * std
+class ScalingVAE6(nn.Module): 
+    def __init__( self, in_channels, latent_dim=128, base=64, depth=4 ): 
+        super().__init__() 
+        self.encoder = EncoderConvZ6(in_channels, latent_dim, base, depth) 
+        self.decoder = ScalingDecoderConvZ6(in_channels, latent_dim, base, depth) 
+
     def forward(self, x): 
         mu, logvar = self.encoder(x) 
         z = reparameterize(mu, logvar) 
-        scaled_image,iamge,image_mean,image_var = self.decoder(z) 
-        return scaled_image,iamge,image_mean,image_var, mu, logvar, z
-    
+        scaled_image,image,image_mean,image_logvar = self.decoder(z) 
+        return scaled_image,image,image_mean,image_logvar, mu, logvar, z
+
 if  __name__=='__main__':
     x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
     model_param={ 'in_channels':3, 
