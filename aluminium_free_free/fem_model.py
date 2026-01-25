@@ -74,7 +74,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch_geometric.data import Data
-from torch_geometric.nn import GATConv,GATv2Conv
+from torch_geometric.nn import GATConv,GATv2Conv,SAGEConv
 from torch_geometric.utils import coalesce
 
 class EdgeGATBlock(nn.Module):
@@ -324,15 +324,15 @@ class MeshGNN_GAT4(nn.Module):
             nn.Linear(hidden, out_dim),
             # nn.ELU() ,  # FEM displacement / stress 양수일 때
         )
-        self.tanh=nn.Tanh()
+        # self.tanh=nn.Tanh()
         self.bn1 = torch.nn.BatchNorm1d(hidden)
     def forward(self, data: Data):
         x = self.lin_in(data.x)
         x = self.bn1(x)
         for block in self.blocks:
             x = block(x, data.edge_index, data.edge_attr)
-        x = self.head(x)
-        return self.tanh(x)
+
+        return self.head(x)
     
 
 class FullMeshGAT(nn.Module):
@@ -382,7 +382,7 @@ class FullMeshGAT(nn.Module):
         x = self.lin_in(x)
 
         for conv, norm in zip(self.convs, self.norms):
-            h = conv(x, edge_index)
+            h = conv(x, edge_index, edge_attr=data.edge_attr)
             h = F.elu(h)
             h = norm(h, batch)
             x = x + h if x.shape == h.shape else h  # residual (safe)
@@ -459,19 +459,6 @@ class SinusoidalTimeEmbedding(nn.Module):
 
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
-
-class FiLM(nn.Module):
-    def __init__(self, cond_dim, hidden):
-        super().__init__()
-        self.gamma = nn.Linear(cond_dim, hidden)
-        self.beta  = nn.Linear(cond_dim, hidden)
-
-    def forward(self, h, cond):
-        """
-        h    : [N,H]
-        cond : [N,Cc]
-        """
-        return self.gamma(cond) * h + self.beta(cond)
 
 class ResidualBlock(nn.Module):
     def __init__(self, hidden):
@@ -616,418 +603,7 @@ class ResidualConvBlock(nn.Module):
         self.conv2[0].in_channels = out_channels
         self.conv2[0].out_channels = out_channels
 
-# class UnetUp(nn.Module):
-#     def __init__(self, in_channels, out_channels):
-#         super(UnetUp, self).__init__()
-        
-#         # Create a list of layers for the upsampling block
-#         # The block consists of a ConvTranspose2d layer for upsampling, followed by two ResidualConvBlock layers
-#         layers = [
-#             nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
-#             ResidualConvBlock(out_channels, out_channels),
-#             ResidualConvBlock(out_channels, out_channels),
-#         ]
-        
-#         # Use the layers to create a sequential model
-#         self.model = nn.Sequential(*layers)
 
-#     def forward(self, x, skip):
-#         # Concatenate the input tensor x with the skip connection tensor along the channel dimension
-#         x = torch.cat((x, skip), 1)
-        
-#         # Pass the concatenated tensor through the sequential model and return the output
-#         x = self.model(x)
-#         return x
-    
-class UnetUp(nn.Module):
-    """
-    x    : (B, Cin, H/2, W/2)
-    skip : (B, Cskip, H,   W)
-    out  : (B, Cout, H,   W)
-    """
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-
-        # 1️⃣ 업샘플
-        self.up = nn.ConvTranspose2d(
-            in_channels,
-            out_channels,
-            kernel_size=2,
-            stride=2,
-        )
-
-        # 2️⃣ concat 이후 conv
-        self.conv1 = ResidualConvBlock(out_channels + skip_channels, out_channels)
-        self.conv2 = ResidualConvBlock(out_channels, out_channels)
-
-    def forward(self, x, skip):
-        # 업샘플
-        x = self.up(x)  # (B, out_channels, H, W)
-
-        # 🔒 안전장치: WH 반드시 같아야 함
-        assert x.shape[-2:] == skip.shape[-2:], \
-            f"WH mismatch: up={x.shape}, skip={skip.shape}"
-
-        # concat
-        x = torch.cat([x, skip], dim=1)
-
-        # convs
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x
-
-# class UnetDown(nn.Module):
-#     def __init__(self, in_channels, out_channels):
-#         super(UnetDown, self).__init__()
-        
-#         # Create a list of layers for the downsampling block
-#         # Each block consists of two ResidualConvBlock layers, followed by a MaxPool2d layer for downsampling
-#         layers = [ResidualConvBlock(in_channels, out_channels), ResidualConvBlock(out_channels, out_channels), nn.MaxPool2d(2)]
-        
-#         # Use the layers to create a sequential model
-#         self.model = nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         # Pass the input through the sequential model and return the output
-#         return self.model(x)
-class UnetDown(nn.Module):
-    """
-    (B, Cin, H, W) -> (B, Cout, H/2, W/2)
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            ResidualConvBlock(in_channels, out_channels),
-            ResidualConvBlock(out_channels, out_channels),
-        )
-        self.pool = nn.MaxPool2d(2)
-
-    def forward(self, x):
-        x = self.block(x)
-        x = self.pool(x)
-        return x
-
-class EmbedFC(nn.Module):
-    def __init__(self, input_dim, emb_dim):
-        super(EmbedFC, self).__init__()
-        '''
-        This class defines a generic one layer feed-forward neural network for embedding input data of
-        dimensionality input_dim to an embedding space of dimensionality emb_dim.
-        '''
-        self.input_dim = input_dim
-        
-        # define the layers for the network
-        layers = [
-            nn.Linear(input_dim, emb_dim),
-            nn.GELU(),
-            nn.Linear(emb_dim, emb_dim),
-        ]
-        
-        # create a PyTorch sequential model consisting of the defined layers
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # flatten the input tensor
-        x = x.view(-1, self.input_dim)
-        # apply the model layers to the flattened tensor
-        return self.model(x)
-
-class ContextUnet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, n_feat=256, n_cfeat=256, height=256):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.n_feat = n_feat
-        self.n_cfeat = n_cfeat
-        self.h = height
-
-        self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
-
-        # encoder
-        self.down1 = UnetDown(n_feat, n_feat)        # (B,256, H/2, W/2)
-        self.down2 = UnetDown(n_feat, 2*n_feat)      # (B,512, H/4, W/4)
-
-        # embeddings (FiLM-ish)
-        self.timeembed1 = EmbedFC(1, 2*n_feat)
-        self.timeembed2 = EmbedFC(1, n_feat)
-        self.contextembed1 = EmbedFC(n_cfeat, 2*n_feat)
-        self.contextembed2 = EmbedFC(n_cfeat, n_feat)
-
-        self.up1 = UnetUp(
-            in_channels=512,
-            skip_channels=256,   # d1
-            out_channels=256
-        )
-
-        self.up2 = UnetUp(
-            in_channels=256,
-            skip_channels=256,   # x0
-            out_channels=256
-        )
-
-        self.out = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat, 3, 1, 1),
-            nn.GroupNorm(8, n_feat),
-            nn.ReLU(),
-            nn.Conv2d(n_feat, out_channels, 3, 1, 1),
-        )
-
-    def forward(self, x, t, c=None):
-        # x0: (B,256,H,W)
-        x0 = self.init_conv(x)
-
-        # down1: (B,256,H/2,W/2)
-        d1 = self.down1(x0)
-
-        # down2: (B,512,H/4,W/4)
-        d2 = self.down2(d1)
-
-        if c is None:
-            c = torch.zeros(x.shape[0], self.n_cfeat, device=x.device)
-
-        # embed -> broadcast
-        cemb1 = self.contextembed1(c).view(-1, 2*self.n_feat, 1, 1)  # (B,512,1,1)
-        temb1 = self.timeembed1(t).view(-1, 2*self.n_feat, 1, 1)
-
-        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)    # (B,256,1,1)
-        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
-
-        # bottleneck에서 conditioning 적용
-        h = cemb1 * d2 + temb1                    # (B,512,H/4,W/4)
-
-        # up1:  H/4 -> H/2, skip=d1 (H/2)
-        u1 = self.up1(h, d1)                      # (B,256,H/2,W/2)
-        u1 = cemb2 * u1 + temb2
-
-        # up2:  H/2 -> H,   skip=x0 (H)
-        u2 = self.up2(u1, x0)                     # (B,256,H,W)
-
-        out = self.out(u2)                        # (B,out_channels,H,W)
-        return out
-
-
-# class ContextUnet(nn.Module):
-#     def __init__(self,in_channels=3, out_channels=1,   n_feat=256,    n_cfeat=256,  height=28,):  # cfeat - context features
-#         super(ContextUnet, self).__init__()
-
-#         # number of input channels, number of intermediate feature maps and number of classes
-#         self.in_channels = in_channels
-#         self.n_feat = n_feat
-#         self.n_cfeat = n_cfeat
-#         self.h = height  #assume h == w. must be divisible by 4, so 28,24,20,16...
-#         self.out_channels=out_channels
-        
-#         # Initialize the initial convolutional layer
-#         self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
-
-#         # Initialize the down-sampling path of the U-Net with two levels
-#         self.down1 = UnetDown(n_feat, n_feat)        # down1 #[10, 256, 8, 8]
-#         self.down2 = UnetDown(n_feat, 2 * n_feat)    # down2 #[10, 256, 4,  4]
-        
-#          # original: self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.GELU())
-#         self.to_vec = nn.Sequential(nn.AvgPool2d((4)), nn.GELU())
-
-#         # Embed the timestep and context labels with a one-layer fully connected neural network
-#         self.timeembed1 = EmbedFC(1, 2*n_feat)
-#         self.timeembed2 = EmbedFC(1, 1*n_feat)
-#         self.contextembed1 = EmbedFC(n_cfeat, 2*n_feat)
-#         self.contextembed2 = EmbedFC(n_cfeat, 1*n_feat)
-
-#         # Initialize the up-sampling path of the U-Net with three levels
-#         self.up0 = nn.Sequential(
-#             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, self.h//4, self.h//4), # up-sample 
-#             nn.GroupNorm(8, 2 * n_feat), # normalize                        
-#             nn.ReLU(),
-#         )
-#         self.up1 = UnetUp(2 * n_feat, n_feat)
-#         self.up2 = UnetUp(1 * n_feat, n_feat)
-
-#         # Initialize the final convolutional layers to map to the same number of channels as the input image
-#         self.out = nn.Sequential(
-#             nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1), # reduce number of feature maps   #in_channels, out_channels, kernel_size, stride=1, padding=0
-#             nn.GroupNorm(8, n_feat), # normalize
-#             nn.ReLU(),
-#             nn.Conv2d(n_feat, self.out_channels, 3, 1, 1), # map to same number of channels as input
-#         )
-
-#     def forward(self, x, t, c=None):
-#         """
-#         x : (batch, n_feat, h, w) : input image
-#         t : (batch, n_cfeat)      : time step
-#         c : (batch, n_classes)    : context label
-#         """
-#         # x is the input image, c is the context label, t is the timestep, context_mask says which samples to block the context on
-
-#         # pass the input image through the initial convolutional layer
-#         x = self.init_conv(x)
-#         # pass the result through the down-sampling path
-#         down1 = self.down1(x)       #[10, 256, 8, 8]
-#         down2 = self.down2(down1)   #[10, 256, 4, 4]
-        
-#         # convert the feature maps to a vector and apply an activation
-#         hiddenvec = self.to_vec(down2)
-        
-#         # mask out context if context_mask == 1
-#         if c is None:
-#             c = torch.zeros(x.shape[0], self.n_cfeat).to(x)
-            
-#         # embed context and timestep
-#         cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)     # (batch, 2*n_feat, 1,1)
-#         temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
-#         cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
-#         temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
-#         #print(f"uunet forward: cemb1 {cemb1.shape}. temb1 {temb1.shape}, cemb2 {cemb2.shape}. temb2 {temb2.shape}")
-
-
-#         up1 = self.up0(hiddenvec)
-#         up2 = self.up1(cemb1*up1 + temb1, down2)  # add and multiply embeddings
-#         up3 = self.up2(cemb2*up2 + temb2, down1)
-#         out = self.out(torch.cat((up3, x), 1))
-#         return out
-
-
-class ResidualConvBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, is_res=False):
-        super().__init__()
-
-        self.same_channels = in_channels == out_channels
-        self.is_res = is_res
-
-        self.conv1 = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, 3, 1, 1),
-            nn.BatchNorm3d(out_channels),
-            nn.GELU(),
-        )
-
-        self.conv2 = nn.Sequential(
-            nn.Conv3d(out_channels, out_channels, 3, 1, 1),
-            nn.BatchNorm3d(out_channels),
-            nn.GELU(),
-        )
-
-        if not self.same_channels:
-            self.shortcut = nn.Conv3d(in_channels, out_channels, 1)
-
-    def forward(self, x):
-        h = self.conv1(x)
-        h = self.conv2(h)
-
-        if self.is_res:
-            if self.same_channels:
-                x = x + h
-            else:
-                x = self.shortcut(x) + h
-            return x / 1.414
-        return h
-
-class UnetDown3D(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-
-        self.model = nn.Sequential(
-            ResidualConvBlock3D(in_channels, out_channels),
-            ResidualConvBlock3D(out_channels, out_channels),
-            nn.MaxPool3d(2)
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-
-class UnetUp3D(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-
-        self.up = nn.ConvTranspose3d(in_channels, out_channels, 2, 2)
-
-        self.block1 = ResidualConvBlock3D(out_channels, out_channels)
-        self.block2 = ResidualConvBlock3D(out_channels, out_channels)
-
-    def forward(self, x, skip):
-        x = torch.cat((x, skip), dim=1)
-        x = self.up(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        return x
-
-
-class ContextUnet3D(nn.Module):
-    def __init__(
-        self,
-        in_channels=1,
-        cond_dim=22,
-        out_channels=1,
-        n_feat=64,
-        n_cfeat=256,
-        size=256,
-    ):
-        super().__init__()
-
-        self.n_feat = n_feat
-        self.n_cfeat = n_cfeat
-        self.size = size
-
-        self.init_conv = ResidualConvBlock3D(in_channels, n_feat, is_res=True)
-
-        self.down1 = UnetDown3D(n_feat, n_feat)
-        self.down2 = UnetDown3D(n_feat, 2 * n_feat)
-
-        self.to_vec = nn.Sequential(
-            nn.AvgPool3d(size // 4),
-            nn.GELU()
-        )
-
-        self.timeembed1 = EmbedFC(1, 2 * n_feat)
-        self.timeembed2 = EmbedFC(1, n_feat)
-        self.contextembed1 = EmbedFC(n_cfeat, 2 * n_feat)
-        self.contextembed2 = EmbedFC(n_cfeat, n_feat)
-
-        self.up0 = nn.Sequential(
-            nn.ConvTranspose3d(2 * n_feat, 2 * n_feat, size // 4, size // 4),
-            nn.GroupNorm(8, 2 * n_feat),
-            nn.ReLU(),
-        )
-
-        self.up1 = UnetUp3D(4 * n_feat, n_feat)
-        self.up2 = UnetUp3D(2 * n_feat, n_feat)
-
-        self.out = nn.Sequential(
-            nn.Conv3d(2 * n_feat, n_feat, 3, 1, 1),
-            nn.GroupNorm(8, n_feat),
-            nn.ReLU(),
-            nn.Conv3d(n_feat, out_channels, 3, 1, 1),
-        )
-
-    def forward(self, x, t, c=None):
-        """
-        x : (B, C, D, H, W)
-        t : (B, 1)
-        c : (B, n_cfeat)
-        """
-
-        x0 = self.init_conv(x)
-
-        d1 = self.down1(x0)
-        d2 = self.down2(d1)
-
-        h = self.to_vec(d2)
-
-        if c is None:
-            c = torch.zeros(x.shape[0], self.n_cfeat, device=x.device)
-
-        cemb1 = self.contextembed1(c).view(-1, 2 * self.n_feat, 1, 1, 1)
-        temb1 = self.timeembed1(t).view(-1, 2 * self.n_feat, 1, 1, 1)
-
-        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1, 1)
-        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1, 1)
-
-        u1 = self.up0(h)
-        u2 = self.up1(cemb1 * u1 + temb1, d2)
-        u3 = self.up2(cemb2 * u2 + temb2, d1)
-
-        out = self.out(torch.cat((u3, x0), dim=1))
-        return out
 
 def sinusoidal_time_embedding(t: torch.Tensor, dim: int, max_period: int = 10000):
     if t.dtype != torch.float32:
@@ -1207,27 +783,70 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class FiLM(nn.Module):
+    def __init__(self, cond_dim, channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, channels * 2)
+        )
+
+    def forward(self, x, cond):
+        """
+        x: [B, C, H, W]
+        cond: [B, D]
+        """
+        gamma, beta = self.net(cond).chunk(2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta  = beta[:, :, None, None]
+        return x * (1 + gamma) + beta
 
 class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, cond_dim):
         super().__init__()
+        self.norm1 = nn.BatchNorm2d(out_ch)#nn.GroupNorm(4, in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+
+        self.norm2 = nn.BatchNorm2d(out_ch)#nn.GroupNorm(4, out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
 
-        self.norm1 = nn.BatchNorm2d(out_ch)
-        self.norm2 = nn.BatchNorm2d(out_ch)
-
-        self.act = nn.SiLU()
+        self.film = FiLM(cond_dim, out_ch)
 
         self.skip = (
             nn.Conv2d(in_ch, out_ch, 1)
             if in_ch != out_ch else nn.Identity()
         )
 
-    def forward(self, x):
-        h = self.act(self.norm1(self.conv1(x)))
-        h = self.norm2(self.conv2(h))
-        return self.act(h + self.skip(x))
+    def forward(self, x, cond):
+        h = F.silu(self.norm1(self.conv1(x)))
+        h = F.silu(self.norm2(self.conv2(h)))
+        h = self.film(h, cond)
+        return h + self.skip(x)
+class ResBlockSpatialCond(nn.Module):
+    def __init__(self, in_ch, out_ch, cond_ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.norm1 = nn.GroupNorm(8, out_ch)
+
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, out_ch)
+
+        self.gamma = nn.Conv2d(cond_ch, out_ch, 3, padding=1)
+        self.beta  = nn.Conv2d(cond_ch, out_ch, 3, padding=1)
+
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, cond):
+        h = self.conv1(x)
+        h = self.norm1(h)
+
+        h = h * (1 + self.gamma(cond)) + self.beta(cond)
+        h = F.silu(h)
+
+        h = self.conv2(h)
+        h = self.norm2(h)
+
+        return h + self.skip(x)
+
 class ResBlockNoAct(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -1712,26 +1331,8 @@ class CondTokens(nn.Module):
         tok = self.proj(cond).view(B, self.num_tokens, self.token_dim)
         return tok
 
-class FiLM(nn.Module):
-    """
-    Produces (gamma, beta) from (cond + time).
-    """
-    def __init__(self, in_dim: int, feat_channels: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(in_dim, feat_channels * 2),
-        )
 
-    def forward(self, h: torch.Tensor, ctx: torch.Tensor):
-        """
-        h:   (B,C,H,W)
-        ctx: (B, in_dim)
-        """
-        gamma, beta = self.mlp(ctx).chunk(2, dim=1)
-        gamma = gamma[:, :, None, None]
-        beta  = beta[:, :, None, None]
-        return gamma * h + beta
+
 class FiLMResBlock(nn.Module):
     def __init__(self, channels: int, ctx_dim: int):
         super().__init__()
@@ -1748,34 +1349,35 @@ class FiLMResBlock(nn.Module):
         return x + h
     
 class CrossAttention(nn.Module):
-    def __init__(self, q_dim: int, kv_dim: int, num_heads: int = 4, head_dim: int = 32):
+    def __init__(self, dim, token_dim, heads=4):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        inner = num_heads * head_dim
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
 
-        self.to_q = nn.Linear(q_dim, inner, bias=False)
-        self.to_k = nn.Linear(kv_dim, inner, bias=False)
-        self.to_v = nn.Linear(kv_dim, inner, bias=False)
-        self.to_out = nn.Linear(inner, q_dim)
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(token_dim, dim)
+        self.to_v = nn.Linear(token_dim, dim)
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor):
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, tokens):
         """
-        q:  (B, Nq, q_dim)  e.g. Nq=16
-        kv: (B, Nk, kv_dim) condition tokens
+        x: [B, HW, C]
+        tokens: [B, T, D]
         """
-        B, Nq, _ = q.shape
-        Nk = kv.size(1)
+        B, N, C = x.shape
+        H = self.heads
 
-        qh = self.to_q(q).view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,Nq,D)
-        kh = self.to_k(kv).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2) # (B,H,Nk,D)
-        vh = self.to_v(kv).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2) # (B,H,Nk,D)
+        q = self.to_q(x).view(B, N, H, C // H).transpose(1, 2)
+        k = self.to_k(tokens).view(B, -1, H, C // H).transpose(1, 2)
+        v = self.to_v(tokens).view(B, -1, H, C // H).transpose(1, 2)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.softmax(torch.matmul(qh, kh.transpose(-2, -1)) * scale, dim=-1)   # (B,H,Nq,Nk)
-        out = torch.matmul(attn, vh)  # (B,H,Nq,D)
-        out = out.transpose(1, 2).contiguous().view(B, Nq, self.num_heads * self.head_dim)
-        return self.to_out(out)  # (B,Nq,q_dim)
+        attn = (q @ k.transpose(-1, -2)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
 class CrossAttnResBlock(nn.Module):
     """
     ResBlock + Cross-Attn (cond tokens) in the middle.
@@ -1786,7 +1388,7 @@ class CrossAttnResBlock(nn.Module):
         self.norm1 = nn.GroupNorm(8, channels)
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
 
-        self.attn = CrossAttention(q_dim=channels, kv_dim=token_dim, num_heads=num_heads, head_dim=max(16, channels // (num_heads*2)))
+        self.attn = CrossAttention(dim=channels, token_dim=token_dim, heads=num_heads, )
         self.norm_attn = nn.LayerNorm(channels)
 
         self.norm2 = nn.GroupNorm(8, channels)
@@ -1837,7 +1439,7 @@ class TinyLatentDiffusion(nn.Module):
         self.in_proj = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
         layers=[]
-        for _ in range(4):
+        for _ in range(8):
             layers.append(FiLMResBlock(base_channels, self.ctx_dim))
             layers.append(CrossAttnResBlock(base_channels, self.ctx_dim, token_dim, num_heads=4))
             layers.append(nn.GroupNorm(8, base_channels))
@@ -1926,6 +1528,81 @@ class LearnableDense(nn.Module):
         x = self.fc3(h)
         return x.view(x.size(0),1,1,1)
 
+class ConditionalUNet(nn.Module):
+    def __init__(
+        self,
+        in_ch=3,
+        out_ch=3,
+        base=64,
+        cond_ch=16,        # 🔥 spatial condition channel
+        token_dim=None
+    ):
+        super().__init__()
+
+        # Encoder
+        self.enc1 = ResBlockSpatialCond(in_ch, base, cond_ch)
+        self.enc2 = ResBlockSpatialCond(base, base * 2, cond_ch)
+        self.enc3 = ResBlockSpatialCond(base * 2, base * 4, cond_ch)
+
+        self.down = nn.AvgPool2d(2)
+
+        # Bottleneck
+        self.mid = ResBlockSpatialCond(base * 4, base * 4, cond_ch)
+
+        # Optional cross-attention
+        self.use_cross = token_dim is not None
+        if self.use_cross:
+            self.cross_attn = CrossAttention(base * 4, token_dim)
+
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+
+        # Decoder
+        self.dec3 = ResBlockSpatialCond(base * 8, base * 2, cond_ch)
+        self.dec2 = ResBlockSpatialCond(base * 4, base, cond_ch)
+        self.dec1 = ResBlockSpatialCond(base * 2, base, cond_ch)
+
+        self.out = nn.Conv2d(base, out_ch, 1)
+
+    def forward(self, x, cond_map, cond_tokens=None):
+        """
+        x         : [B, C, H, W]
+        cond_map  : [B, Cc, H, W]
+        """
+
+        # ---- Encoder ----
+        # c1 = cond_map
+        B,C,W,H=x.shape
+        c1 = F.interpolate(cond_map, size=(W, H), mode="nearest")
+        e1 = self.enc1(x, c1)
+
+        c2 = self.down(c1)
+        e2 = self.enc2(self.down(e1), c2)
+
+        c3 = self.down(c2)
+        e3 = self.enc3(self.down(e2), c3)
+
+        # ---- Bottleneck ----
+        c4 = self.down(c3)
+        h = self.mid(self.down(e3), c4)
+
+        if self.use_cross and cond_tokens is not None:
+            B, C, Hh, Ww = h.shape
+            h_flat = h.permute(0, 2, 3, 1).reshape(B, Hh * Ww, C)
+            h_flat = h_flat + self.cross_attn(h_flat, cond_tokens)
+            h = h_flat.view(B, Hh, Ww, C).permute(0, 3, 1, 2)
+
+        # ---- Decoder ----
+        h = self.up(h)
+        h = self.dec3(torch.cat([h, e3], dim=1), c3)
+
+        h = self.up(h)
+        h = self.dec2(torch.cat([h, e2], dim=1), c2)
+
+        h = self.up(h)
+        h = self.dec1(torch.cat([h, e1], dim=1), c1)
+
+        return self.out(h)
+
 
 class ScalingDecoderConvZ5(nn.Module):
     def __init__(self, out_channels, latent_dim, base, depth): 
@@ -1935,7 +1612,7 @@ class ScalingDecoderConvZ5(nn.Module):
         layers = [] 
         for i in reversed(range(depth)): 
             out_ch = base * (2 ** i) 
-            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(ResBlockNoAct(ch, out_ch)) 
             layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
             layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
             layers.append(nn.SiLU()) 
@@ -1945,34 +1622,30 @@ class ScalingDecoderConvZ5(nn.Module):
         
         self.image_mean_conv=LearnableDense(latent_dim,base)
 
-        ch = latent_dim 
-        layers = [] 
-        for i in reversed(range(depth)): 
-            out_ch = base * (2 ** i) 
-            layers.append(ResBlockNoAct(ch, out_ch)) 
-            layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
-            layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
-            ch = out_ch 
-        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
-        self.image_logvar_conv=nn.Sequential(*layers)  #LearnableSpatialReducer(base)
+        # ch = latent_dim 
+        # layers = [] 
+        # for i in reversed(range(depth)): 
+        #     out_ch = base * (2 ** i) 
+        #     layers.append(ResBlockNoAct(ch, out_ch)) 
+        #     layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
+        #     layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
+        #     ch = out_ch 
+        # layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
+        # self.image_logvar_conv=nn.Sequential(*layers)  #LearnableSpatialReducer(base)
         
-        layers = [] 
-        ch =out_channels
-        for i in reversed(range(depth)): 
-            layers.append(ResBlockNoAct(ch, base)) 
-            ch = out_ch 
-        layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
-
-        self.std_layers=nn.Sequential(*layers)  #LearnableSpatialReducer(base)
-    
+        self.std_layers=ConditionalUNet(in_ch=3,
+                                        out_ch=3,
+                                        base=64,
+                                        cond_ch=latent_dim,
+                                        token_dim=None)
+        self.avg_layers=ConditionalUNet(in_ch=3,
+                                    out_ch=3,
+                                    base=64,
+                                    cond_ch=latent_dim,
+                                    token_dim=None)
     def forward(self, latent): 
-        image_mean=self.image_mean_conv(latent)# [B,Z] ->B 1
-        image_logvar=self.image_logvar_conv(latent)# B,C,X,Y 
-        scaled_image=self.conv(latent)
-        B,C,X,Y=scaled_image.shape
-        mean=image_mean[:,:,0,0].unsqueeze(-1).unsqueeze(-1) 
-        image=torch.matmul(scaled_image,image_logvar)
-        image=self.std_layers(image)+mean.expand(B,C,X,Y) 
+        scaled_image=self.conv(latent) 
+        image=scaled_image*self.std_layers(scaled_image,latent)+self.avg_layers(scaled_image,latent)
         return scaled_image,image
 
 class EncoderConvZ5(nn.Module): 
@@ -1982,7 +1655,8 @@ class EncoderConvZ5(nn.Module):
         ch = in_channels 
         for i in range(depth): 
             out_ch = base * (2 ** i) 
-            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(ResBlockNoAct(ch, out_ch)) 
+            layers.append( nn.SiLU())
             layers.append(nn.AvgPool2d(2)) 
             ch = out_ch 
         
@@ -1991,8 +1665,10 @@ class EncoderConvZ5(nn.Module):
         layers_conv_logvar = []
         ch=out_ch
         for i in range(depth): 
-            layers_conv_mu.append(ResBlock(ch, latent_dim)) 
-            layers_conv_logvar.append(ResBlock(ch, latent_dim))
+            layers_conv_mu.append(ResBlockNoAct(ch, latent_dim)) 
+            layers_conv_mu.append(nn.SiLU()) 
+            layers_conv_logvar.append(ResBlockNoAct(ch, latent_dim))
+            layers_conv_logvar.append(nn.SiLU()) 
             ch = latent_dim 
 
         self.conv_mu = nn.Sequential(*layers_conv_mu)
@@ -2000,7 +1676,7 @@ class EncoderConvZ5(nn.Module):
     
     def forward(self, x):
         h = self.conv(x) 
-        logvar = torch.clamp(self.conv_logvar(h), min=-0.3, max=0.3)
+        logvar = torch.clamp(self.conv_logvar(h), min=-10, max=10)
         return self.conv_mu(h), logvar 
 
 def reparameterize(mu, logvar): 
@@ -2019,33 +1695,67 @@ class ScalingVAE5(nn.Module):
         scaled_image,iamge = self.decoder(z) 
         return scaled_image,iamge, mu, logvar, z
 
+class ResBlockForRESNET(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1)
+
+    def forward(self, x):
+        h = F.silu(self.conv1(x))
+        h = self.conv2(h)
+        return F.silu(x + h)
+
+
+class SmallResNetCond(nn.Module):
+    def __init__(self, in_ch=3, cond_ch=16, out_ch=3, base=64, depth=4):
+        super().__init__()
+
+        self.in_proj = nn.Conv2d(in_ch + cond_ch, base, 3, padding=1)
+
+        self.blocks = nn.Sequential(
+            *[ResBlockForRESNET(base) for _ in range(depth)]
+        )
+
+        self.out = nn.Conv2d(base, out_ch, 1)
+
+    def forward(self, x, cond_map):
+        if cond_map.shape[-2:] != x.shape[-2:]:
+            cond_map = F.interpolate(
+                cond_map, size=x.shape[-2:],
+                mode="bilinear", align_corners=False
+            )
+
+        h = torch.cat([x, cond_map], dim=1)
+        h = F.silu(self.in_proj(h))
+        h = self.blocks(h)
+        return self.out(h)
+
 
 class ScalingDecoderConvZ6(nn.Module):
     def __init__(self, out_channels, latent_dim, base, depth): 
         super().__init__() 
         self.latent_dim=latent_dim 
-        ch = latent_dim
+        ch = latent_dim 
         layers = [] 
         for i in reversed(range(depth)): 
             out_ch = base * (2 ** i) 
-            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(ResBlockNoAct(ch, out_ch)) 
             layers.append( nn.ConvTranspose2d( out_ch, out_ch, kernel_size=4, stride=2, padding=1 ) ) 
             layers.append(nn.BatchNorm2d(out_ch, eps=1e-8)) 
             layers.append(nn.SiLU()) 
             ch = out_ch 
         layers.append(nn.Conv2d(ch, out_channels, 3, padding=1)) 
         self.conv = nn.Sequential(*layers) 
-        # self.image_mean_conv=LearnableSpatialReducer(base)
-        # self.image_logvar_conv=LearnableSpatialReducer(base)
+        
+        self.std_layers=SmallResNetCond(in_ch=3, cond_ch=latent_dim, out_ch=3, base=64, depth=4)
+        self.avg_layers=SmallResNetCond(in_ch=3, cond_ch=latent_dim, out_ch=3, base=64, depth=4)
 
     def forward(self, latent): 
-        image=self.conv(latent)
-        mean = image.mean(dim=(1,2,3), keepdim=True).detach()
-        std = image.std(dim=(1,2,3), keepdim=True).detach()+1e-12
-        image_logvar=torch.log(std**2)
-        scaled_image=(image-mean)/std 
+        scaled_image=self.conv(latent) 
+        image=scaled_image*self.std_layers(scaled_image,latent)+self.avg_layers(scaled_image,latent)
+        return scaled_image,image
 
-        return scaled_image,image,mean,image_logvar
 class EncoderConvZ6(nn.Module): 
     def __init__(self, in_channels, latent_dim, base, depth): 
         super().__init__() 
@@ -2053,18 +1763,20 @@ class EncoderConvZ6(nn.Module):
         ch = in_channels 
         for i in range(depth): 
             out_ch = base * (2 ** i) 
-            layers.append(ResBlock(ch, out_ch)) 
+            layers.append(ResBlockNoAct(ch, out_ch)) 
+            layers.append( nn.SiLU())
             layers.append(nn.AvgPool2d(2)) 
             ch = out_ch 
         
         self.conv = nn.Sequential(*layers) 
-        
         layers_conv_mu = [] 
         layers_conv_logvar = []
         ch=out_ch
         for i in range(depth): 
-            layers_conv_mu.append(ResBlock(ch, latent_dim)) 
-            layers_conv_logvar.append(ResBlock(ch, latent_dim))
+            layers_conv_mu.append(ResBlockNoAct(ch, latent_dim)) 
+            layers_conv_mu.append(nn.SiLU()) 
+            layers_conv_logvar.append(ResBlockNoAct(ch, latent_dim))
+            layers_conv_logvar.append(nn.SiLU()) 
             ch = latent_dim 
 
         self.conv_mu = nn.Sequential(*layers_conv_mu)
@@ -2085,12 +1797,12 @@ class ScalingVAE6(nn.Module):
         self.encoder = EncoderConvZ6(in_channels, latent_dim, base, depth) 
         self.decoder = ScalingDecoderConvZ6(in_channels, latent_dim, base, depth) 
 
-    def forward(self, x): 
+    def forward(self, x ): 
         mu, logvar = self.encoder(x) 
         z = reparameterize(mu, logvar) 
-        scaled_image,image,image_mean,image_logvar = self.decoder(z) 
-        return scaled_image,image,image_mean,image_logvar, mu, logvar, z
-
+        scaled_image,iamge = self.decoder(z) 
+        return scaled_image,iamge, mu, logvar, z
+    
 if  __name__=='__main__':
     x = torch.randn(16, 3, 64, 64)   # [16,3,64,64]
     model_param={ 'in_channels':3, 

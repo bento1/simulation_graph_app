@@ -5,10 +5,11 @@ import pandas as pd
 import torch.nn.functional as F
 import torch
 from torch_geometric.loader import DataLoader
-from fem_dataset_standard_scaler_full_mesh import FemGraphDataset
+from fem_dataset_minmax_scaler_full_mesh import FemGraphDataset
 from fem_model import FullMeshGAT
 from tqdm import tqdm
 from utils import EarlyStopping
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 early_stopping = EarlyStopping(
     patience=50,     # FEM/GNN은 15~30 권장
@@ -54,28 +55,24 @@ def main():
     else :
         device='cpu'
 
-    ds = FemGraphDataset(root_dir=root, knn_k=12, use_cell_edges=True)
-
-    n = len(ds)
-    n_train = int(n * 0.9)
-    train_ds = ds[:n_train]
-    val_ds = ds[n_train:]
+    train_ds = FemGraphDataset(root_dir=root,type='train', knn_k=12, use_cell_edges=True)
+    val_ds = FemGraphDataset(root_dir=root,type='valid', knn_k=12, use_cell_edges=True)
 
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=4, shuffle=False)
 
-    example = ds[0]
+    example = train_ds[0]
 
     model_param={'in_dim':example.x.shape[1],
             'edge_dim':4,
             'hidden':64,
-            'layers':3,
-            'head':2,
+            'layers':8,
+            'head':4,
             'out_dim':1,
             'dropout':0.001,
-            'dataset_scale_info':ds.scale_info,
+            'dataset_scale_info':train_ds.scale_info,
             'loss_scale':1.0,
-            'learning_rate':1e-2
+            'learning_rate':1e-6
             }
     
     model = FullMeshGAT(in_dim=model_param['in_dim'],

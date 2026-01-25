@@ -2,7 +2,7 @@
 import os, json
 import numpy as np
 import pandas as pd
-from utils import feature_standard_normalize,standard_scale
+from utils import feature_normalize,minmax_scale
 import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
@@ -151,9 +151,9 @@ class FemGraphDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        params,Lx, Ly, Lz = feature_standard_normalize(params,self.scale_info)
+        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info,(-1,1))
         for key in ["x","y","z","ux","uy","uz"]:
-            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max'],(-1,1)))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
         y = disp_df[["uz"]].to_numpy(dtype=np.float32)
 
@@ -211,9 +211,9 @@ class FemGraphInferenceDataset(Dataset):
         disp_df  = pd.read_csv(os.path.join(sd, "nodal_stress_disp.csv")).sort_values("node_id")
         with open(os.path.join(sd, "params.json"), "r", encoding="utf-8") as f:
             params = json.load(f)
-        params,Lx, Ly, Lz = feature_standard_normalize(params,self.scale_info)
-        for key in ["x","y","z",]:
-            disp_df[key]= disp_df[key].apply(lambda v:standard_scale(v,self.scale_info[key]['std'],self.scale_info[key]['mean'],self.scale_info[key]['max']))
+        params,Lx, Ly, Lz = feature_normalize(params,self.scale_info,(-1,1))
+        for key in ["x","y","z","ux","uy","uz"]:
+            disp_df[key]= disp_df[key].apply(lambda v:minmax_scale(v,self.scale_info[key]['min'],self.scale_info[key]['max'],(-1,1)))
         xyz = disp_df[["x","y","z"]].to_numpy(dtype=np.float32)
 
         x = build_node_features(xyz, params)  # [N,F]

@@ -6,7 +6,7 @@
   "learning_rate": 0.001,
   "num_epochs": 1000,
   "base": 128,
-  "latent_dim": 64,
+  "latent_dim": 128,
   "batch_size": 128,
   "depth": 4,
   "cond_dim": 20,

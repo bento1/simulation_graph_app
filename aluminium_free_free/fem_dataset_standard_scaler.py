@@ -67,11 +67,11 @@ def build_node_features(nodes_xyz: np.ndarray, params: dict) -> np.ndarray:
     return x
 
 class FemGraphDataset(Dataset):
-    def __init__(self, root_dir: str, knn_k: int = 12, use_cell_edges: bool = True):
+    def __init__(self, root_dir: str,type='train', use_cell_edges: bool = True):
         super().__init__()
         self.root_dir = root_dir
-        self.knn_k = knn_k
         self.use_cell_edges = use_cell_edges
+        self.type=type
         self.samples = sorted([
             os.path.join(root_dir, d) for d in os.listdir(root_dir)
             if os.path.isdir(os.path.join(root_dir, d))
@@ -85,14 +85,11 @@ class FemGraphDataset(Dataset):
                 print(f"Error in finding data info for {sd}: {e}")
                 continue
         print("Loading FEM graph dataset...")
-        for sd in tqdm(self.samples):
-            try:
-                full_data = self._load_full_graph(sd)
-                subgraphs = self._split_graph(full_data, 1000)
-                self.data_list.extend(subgraphs)
-            except Exception as e:
-                print(f"Error in loading graph for {sd}: {e}")
-                continue
+        cut_ind=int(len(self.samples)*0.95)
+        if self.type=='train':
+            self.samples=self.samples[:cut_ind]
+        else:
+            self.samples=self.samples[cut_ind:]
             # break
         print("Build Complete FEM graph dataset...")
     
@@ -142,8 +139,8 @@ class FemGraphDataset(Dataset):
                 self.scale_info[key]['std']=np.sqrt(M2/(self.scale_info[key]['num']-1)) if self.scale_info[key]['num']>1 else 0
                 self.scale_info[key]['num']+=num_data
     
-    def len(self):
-        return len(self.data_list)
+    def __len__(self):
+        return len(self.samples)
     
     def _split_graph(self, data: Data, max_nodes=2000):
         subgraphs = []
@@ -194,13 +191,18 @@ class FemGraphDataset(Dataset):
         data.edge_attr = build_edge_attr(data.edge_index, data.pos,Lx, Ly, Lz)
         return data
         
-    def get(self, idx):
-        return self.data_list[idx]
+    def __getitem__(self, idx):
+        result=[]
+
+        full_data = self._load_full_graph(self.samples[idx])
+        subgraphs = self._split_graph(full_data, 1000)
+        result.extend(subgraphs)
+
+        return result
 class FemGraphInferenceDataset(Dataset):
-    def __init__(self, root_dir: str, scale_info:dict, knn_k: int = 12, use_cell_edges: bool = True):
+    def __init__(self, root_dir: str, scale_info:dict, use_cell_edges: bool = True):
         super().__init__()
         self.root_dir = root_dir
-        self.knn_k = knn_k
         self.use_cell_edges = use_cell_edges
         self.samples = sorted([
             os.path.join(root_dir, d) for d in os.listdir(root_dir)

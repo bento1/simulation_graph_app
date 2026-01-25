@@ -176,7 +176,7 @@ class FemImageDataset(Dataset):
                 print(f"Error in finding data info for {sd}: {e}")
                 continue
         print("Loading FEM graph dataset...")
-        cut_ind=int(len(self.samples)*0.9)
+        cut_ind=int(len(self.samples)*0.95)
         if self.type=='train':
             self.samples=self.samples[:cut_ind]
         else:
