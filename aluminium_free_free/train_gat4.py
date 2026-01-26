@@ -15,43 +15,36 @@ import random
 
 def collate_flatten(batch): 
     batch_size=len(batch) 
-    new_batch=[]
-    for b in batch:
-        new_batch.extend(b)
-    del batch
-    gc.collect()
-    result=[]
-    random.shuffle(new_batch)
-    for i in range(0,len(new_batch)//batch_size,batch_size): 
-        end_index = min(i+batch_size, len(new_batch))
-        mini_batches=new_batch[i:end_index]
-        mini_x=[]
-        mini_y=[]
-        mini_pos=[]
-        mini_edge_index=[]
-        mini_edge_attr=[]
-
-        for mb in mini_batches:
-            mini_x.append(mb.x)
-            mini_y.append(mb.y)
-            mini_pos.append(mb.pos)
-            mini_edge_index.append(mb.edge_index)
-            mini_edge_attr.append(mb.edge_attr)
-        data = Data(
-                x=torch.cat(mini_x, dim=0)  ,
-                y=torch.cat(mini_y, dim=0)  ,
-                pos=torch.cat(mini_pos, dim=0)  ,   # pos는 따로 보관(편함)
-                edge_index=torch.cat(mini_edge_index, dim=1)  , 
-                edge_attr=torch.cat(mini_edge_attr, dim=0)  ,
-            )
-        result.append(data)
-    return result
+    result=[] 
+    for b in batch: 
+        for i in range(0,len(b),batch_size): 
+            end_index = min(i+batch_size, len(b))
+            mini_batches=b[i:end_index] 
+            mini_x=[] 
+            mini_y=[] 
+            mini_pos=[] 
+            mini_edge_index=[] 
+            mini_edge_attr=[] 
+            for mb in mini_batches: 
+                mini_x.append(mb.x) 
+                mini_y.append(mb.y) 
+                mini_pos.append(mb.pos) 
+                mini_edge_index.append(mb.edge_index)
+                mini_edge_attr.append(mb.edge_attr)
+            data = Data( x=torch.cat(mini_x, dim=0) ,
+                            y=torch.cat(mini_y, dim=0) , 
+                            pos=torch.cat(mini_pos, dim=0) , # pos는 따로 보관(편함) 
+                            edge_index=torch.cat(mini_edge_index, dim=1) , 
+                            edge_attr=torch.cat(mini_edge_attr, dim=0) , ) 
+            result.append(data) 
+        return result
 
 early_stopping = EarlyStopping(
     patience=50,     # FEM/GNN은 15~30 권장
     min_delta=1e-8,  # loss 스케일에 맞게
     mode="min"
 )
+
 eps = 1e-8
 best_val = float("inf")
 def train_one_epoch(model, loader, opt, device, loss_scale):
@@ -110,7 +103,7 @@ def main():
             'dropout':0.001,
             'dataset_scale_info':train_ds.scale_info,
             'loss_scale':1.0,
-            'learning_rate':1e-6
+            'learning_rate':1e-4
             }
     
     model = MeshGNN_GAT4(in_dim=model_param['in_dim'],
@@ -122,9 +115,11 @@ def main():
                 dropout=model_param['dropout']).to(device)
     
     opt = torch.optim.AdamW(model.parameters(), lr=model_param['learning_rate'], weight_decay=1e-6)
-    # if os.path.exists(f"mesh_invariant_gat4_early.pt"):
-    #     checkpoint = torch.load(f"mesh_invariant_gat4_early.pt", map_location=device)
-    #     model.load_state_dict(checkpoint)
+    schd = EarlyStopping(
+        patience=5,     # FEM/GNN은 15~30 권장
+        min_delta=1e-4,  # loss 스케일에 맞게
+        mode="min"
+    )
     loss_dict={}
     for epoch in tqdm(range(1, 1000)):
         tr = train_one_epoch(model, train_loader, opt, device,model_param['loss_scale'])
@@ -134,21 +129,32 @@ def main():
             print(f"epoch {epoch:03d} | train {tr:.6e} | val {va:.6e}")
         # early stopping 체크
         improved = early_stopping.step(va)
-
+        improved_lr = schd.step(va)
         if improved:
             best_val = va
-            torch.save(model.state_dict(), "mesh_invariant_gat4_early.pt")  # best만 저장
+            torch.save(model.state_dict(), f"mesh_invariant_gat4_early_{str(epoch).zfill(3)}.pt")  # best만 저장
             with open(f"loss_history_gat4_early.json", "w", encoding="utf-8") as f:
                 json.dump(loss_dict, f, indent=2)
             with open(f"model_param_gat4_early.json", "w", encoding="utf-8") as f:
                 json.dump(model_param, f, indent=2)
+        if improved_lr:
+            pass
+        else:
+            schd = EarlyStopping(
+                patience=5,     # FEM/GNN은 15~30 권장
+                min_delta=1e-4,  # loss 스케일에 맞게
+                mode="min"
+            )
+            for param_group in opt.param_groups:
+                param_group['lr'] = param_group['lr']/5
+
         if early_stopping.should_stop:
             print(
                 f"\n Early stopping at epoch {epoch} "
                 f"(best val = {best_val:.6e})"
             )
             break
-    torch.save(model.state_dict(), "mesh_invariant_gat4.pt")
+    torch.save(model.state_dict(),f"mesh_invariant_gat4_{str(epoch).zfill(3)}.pt")
     print("saved: mesh_invariant_gat4.pt")
     with open(f"loss_history_gat4.json", "w", encoding="utf-8") as f:
         json.dump(loss_dict, f, indent=2)
