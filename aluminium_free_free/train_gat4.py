@@ -52,15 +52,32 @@ def train_one_epoch(model, loader, opt, device, loss_scale):
     total = 0.0
     for i,batch in tqdm(enumerate(loader)):
         for mini_batch in batch:
-            mini_batch = mini_batch.to(device)
-            pred = model(mini_batch)
-            loss = torch.sqrt(F.mse_loss(pred, mini_batch.y) + eps)*loss_scale
-            del mini_batch, pred
-            gc.collect()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += float(loss.item())
+            try:
+                mini_batch = mini_batch.to(device)
+                E = mini_batch.edge_index.size(1)
+                if E == 0:
+                    continue
+                pred = model(mini_batch)
+                loss = torch.sqrt(F.mse_loss(pred, mini_batch.y) + eps)*loss_scale
+                del mini_batch, pred
+                gc.collect()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total += float(loss.item())
+            except RuntimeError as e:
+                # if 'out of memory' in str(e):
+                print(f"Skipping batch {i} due to out of memory")
+                
+                if torch.cuda.is_available() :
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available() :
+                    torch.mps.empty_cache()
+                else :
+                    torch.mps.empty_cache()
+                gc.collect()
+                continue
+                
     return total / max(1, len(loader))
 
 
@@ -103,7 +120,7 @@ def main():
             'dropout':0.001,
             'dataset_scale_info':train_ds.scale_info,
             'loss_scale':1.0,
-            'learning_rate':1e-4
+            'learning_rate':1e-6
             }
     
     model = MeshGNN_GAT4(in_dim=model_param['in_dim'],
@@ -113,23 +130,25 @@ def main():
                 heads=model_param['head'],
                 out_dim=model_param['out_dim'],
                 dropout=model_param['dropout']).to(device)
-    
+    # ckpt = torch.load("mesh_invariant_gat4_early_013.pt", map_location=device)
+    # model.load_state_dict(ckpt)
     opt = torch.optim.AdamW(model.parameters(), lr=model_param['learning_rate'], weight_decay=1e-6)
-    schd = EarlyStopping(
-        patience=5,     # FEM/GNN은 15~30 권장
-        min_delta=1e-4,  # loss 스케일에 맞게
-        mode="min"
-    )
+    # schd = EarlyStopping(
+    #     patience=10,     # FEM/GNN은 15~30 권장
+    #     min_delta=1e-6,  # loss 스케일에 맞게
+    #     mode="min"
+    # )
     loss_dict={}
     for epoch in tqdm(range(1, 1000)):
+        epoch=epoch+14
         tr = train_one_epoch(model, train_loader, opt, device,model_param['loss_scale'])
         va = eval_one_epoch(model, val_loader, device,model_param['loss_scale'])
-        loss_dict[epoch] = {'train_loss':tr, 'val_loss':va}   
+        loss_dict[epoch] = {'train_loss':tr, 'val_loss':va ,'lr':opt.param_groups[0]['lr']}   
         if epoch % 5 == 0 :
             print(f"epoch {epoch:03d} | train {tr:.6e} | val {va:.6e}")
         # early stopping 체크
         improved = early_stopping.step(va)
-        improved_lr = schd.step(va)
+        # improved_lr = schd.step(va)
         if improved:
             best_val = va
             torch.save(model.state_dict(), f"mesh_invariant_gat4_early_{str(epoch).zfill(3)}.pt")  # best만 저장
@@ -137,16 +156,17 @@ def main():
                 json.dump(loss_dict, f, indent=2)
             with open(f"model_param_gat4_early.json", "w", encoding="utf-8") as f:
                 json.dump(model_param, f, indent=2)
-        if improved_lr:
-            pass
-        else:
-            schd = EarlyStopping(
-                patience=5,     # FEM/GNN은 15~30 권장
-                min_delta=1e-4,  # loss 스케일에 맞게
-                mode="min"
-            )
-            for param_group in opt.param_groups:
-                param_group['lr'] = param_group['lr']/5
+        # if improved_lr:
+        #     pass
+        # else:
+        #     schd = EarlyStopping(
+        #         patience=5,     # FEM/GNN은 15~30 권장
+        #         min_delta=1e-6,  # loss 스케일에 맞게
+        #         mode="min"
+        #     )
+        #     for param_group in opt.param_groups:
+        #         param_group['lr'] = param_group['lr']/2
+        #     print(f"Learning rate decreased at epoch {epoch}",param_group['lr'])
 
         if early_stopping.should_stop:
             print(
